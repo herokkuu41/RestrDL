@@ -3,13 +3,15 @@ import math
 import shutil
 import asyncio
 import inspect
+import uuid
+import time
 from typing import Optional, Callable, Tuple, Any
 
 import pyrogram
 from pyrogram import raw, utils
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Session, Auth
-from pyrogram.errors import FileReferenceExpired, FloodWait, AuthKeyDuplicated
+from pyrogram.errors import FileReferenceExpired, FloodWait, AuthKeyDuplicated, AuthBytesInvalid
 
 from config import PyroConf
 from logger import LOGGER
@@ -135,15 +137,24 @@ class MTProtoWorkerSession:
         await self.session.start()
 
         if self.dc_id != main_dc:
-            exported_auth = await self.client.invoke(
-                raw.functions.auth.ExportAuthorization(dc_id=self.dc_id)
-            )
-            await self.session.invoke(
-                raw.functions.auth.ImportAuthorization(
-                    id=exported_auth.id,
-                    bytes=exported_auth.bytes
+            for _ in range(3):
+                exported_auth = await self.client.invoke(
+                    raw.functions.auth.ExportAuthorization(dc_id=self.dc_id)
                 )
-            )
+                try:
+                    await self.session.invoke(
+                        raw.functions.auth.ImportAuthorization(
+                            id=exported_auth.id,
+                            bytes=exported_auth.bytes
+                        )
+                    )
+                except AuthBytesInvalid:
+                    continue
+                else:
+                    break
+            else:
+                await self.session.stop()
+                raise AuthBytesInvalid("Failed to import authorization after 3 attempts")
 
     async def fetch_chunk(self, location: Any, offset_bytes: int, limit: int) -> bytes:
         if not self.session:
@@ -176,22 +187,23 @@ class MTProtoWorkerSession:
 
 def resolve_destination_path(message: Any, file_name: Optional[str], media_kind: str, original_file_name: Optional[str]) -> str:
     """Resolve the final absolute download file path."""
+    ext = ".bin"
+    if media_kind == "photo":
+        ext = ".jpg"
+    elif media_kind in ("video", "animation", "video_note"):
+        ext = ".mp4"
+    elif media_kind == "audio":
+        ext = ".mp3"
+    elif media_kind == "voice":
+        ext = ".ogg"
+
     if file_name:
         dest_path = os.path.abspath(file_name)
         if os.path.isdir(dest_path) or file_name.endswith("/") or file_name.endswith("\\"):
-            base_name = original_file_name or f"{media_kind}_{getattr(message, 'id', 'media')}.bin"
+            base_name = original_file_name or f"{media_kind}_{getattr(message, 'id', 'media')}{ext}"
             dest_path = os.path.join(dest_path, base_name)
     else:
         directory = os.path.abspath("downloads")
-        ext = ".bin"
-        if media_kind == "photo":
-            ext = ".jpg"
-        elif media_kind in ("video", "animation", "video_note"):
-            ext = ".mp4"
-        elif media_kind == "audio":
-            ext = ".mp3"
-        elif media_kind == "voice":
-            ext = ".ogg"
         base_name = original_file_name or f"{media_kind}_{getattr(message, 'id', 'media')}{ext}"
         dest_path = os.path.join(directory, base_name)
 
@@ -252,7 +264,10 @@ async def fast_download(
         return await fallback_download(message, file_name, progress, progress_args, abort_event)
 
     # 6. Calculate chunk distribution and worker count
-    worker_limit = num_workers or PyroConf.PARALLEL_DOWNLOAD_WORKERS or 3
+    worker_limit = num_workers if num_workers is not None else getattr(PyroConf, "PARALLEL_DOWNLOAD_WORKERS", 3)
+    if not worker_limit or worker_limit <= 1:
+        return await fallback_download(message, file_name, progress, progress_args, abort_event)
+
     total_chunks = math.ceil(file_size / CHUNK_SIZE)
     active_worker_count = min(worker_limit, total_chunks)
 
@@ -260,7 +275,8 @@ async def fast_download(
         return await fallback_download(message, file_name, progress, progress_args, abort_event)
 
     dest_path = resolve_destination_path(message, file_name, kind, orig_filename)
-    temp_path = dest_path + ".temp"
+    unique_suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    temp_path = f"{dest_path}.{unique_suffix}.temp"
 
     # 7. Attempt parallel download across MTProto sessions
     workers = []
@@ -274,6 +290,7 @@ async def fast_download(
     write_lock = asyncio.Lock()
     progress_lock = asyncio.Lock()
     completed_successfully = False
+    worker_tasks = []
 
     try:
         # Pre-allocate sparse/zeroed temporary file
@@ -303,19 +320,46 @@ async def fast_download(
                 except asyncio.QueueEmpty:
                     break
 
-                chunk_bytes = await worker.fetch_chunk(
-                    location=location,
-                    offset_bytes=offset_bytes,
-                    limit=CHUNK_SIZE
-                )
+                expected_bytes = min(CHUNK_SIZE, file_size - offset_bytes)
+                if expected_bytes <= 0:
+                    queue.task_done()
+                    continue
+
+                max_chunk_retries = 2
+                chunk_bytes = None
+                for attempt in range(max_chunk_retries + 1):
+                    if abort_event and abort_event.is_set():
+                        raise asyncio.CancelledError("Aborted by abort_event")
+                    try:
+                        chunk_bytes = await worker.fetch_chunk(
+                            location=location,
+                            offset_bytes=offset_bytes,
+                            limit=CHUNK_SIZE
+                        )
+                        break
+                    except (FileReferenceExpired, AuthKeyDuplicated, FloodWait, asyncio.CancelledError):
+                        raise
+                    except Exception as chunk_err:
+                        if attempt == max_chunk_retries:
+                            raise
+                        LOGGER(__name__).warning(
+                            f"Worker fetch chunk {chunk_idx} failed (attempt {attempt+1}/{max_chunk_retries+1}): {chunk_err}. Retrying..."
+                        )
+                        await asyncio.sleep(0.5)
 
                 if abort_event and abort_event.is_set():
                     raise asyncio.CancelledError("Aborted by abort_event")
 
+                if len(chunk_bytes) != expected_bytes:
+                    raise RuntimeError(
+                        f"Chunk {chunk_idx} size mismatch: expected {expected_bytes} bytes, received {len(chunk_bytes)} bytes"
+                    )
+
                 async with write_lock:
-                    file_handle.seek(offset_bytes)
-                    file_handle.write(chunk_bytes)
-                    file_handle.flush()
+                    if file_handle is not None and not file_handle.closed:
+                        file_handle.seek(offset_bytes)
+                        file_handle.write(chunk_bytes)
+                        file_handle.flush()
 
                 downloaded_bytes += len(chunk_bytes)
 
@@ -325,13 +369,26 @@ async def fast_download(
                             res = progress(downloaded_bytes, file_size, *progress_args)
                             if inspect.iscoroutine(res):
                                 await res
+                        except pyrogram.StopTransmission:
+                            raise
                         except Exception as pe:
                             LOGGER(__name__).debug(f"Progress error: {pe}")
 
                 queue.task_done()
 
         worker_tasks = [asyncio.create_task(worker_loop(w)) for w in workers]
-        await asyncio.gather(*worker_tasks)
+        try:
+            await asyncio.gather(*worker_tasks)
+        finally:
+            for t in worker_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        if downloaded_bytes != file_size:
+            raise RuntimeError(
+                f"Incomplete download: received {downloaded_bytes} bytes, expected {file_size} bytes"
+            )
 
         # Final progress notification
         if progress:
@@ -340,6 +397,8 @@ async def fast_download(
                     res = progress(file_size, file_size, *progress_args)
                     if inspect.iscoroutine(res):
                         await res
+                except pyrogram.StopTransmission:
+                    raise
                 except Exception:
                     pass
 
@@ -361,11 +420,13 @@ async def fast_download(
     except (FileReferenceExpired, AuthKeyDuplicated, FloodWait, asyncio.CancelledError) as e:
         # Crucial errors that caller must handle or propagate
         raise e
+    except pyrogram.StopTransmission:
+        LOGGER(__name__).info("Download stopped via pyrogram.StopTransmission in progress callback.")
+        return None
     except Exception as exc:
         LOGGER(__name__).warning(
             f"Parallel download failed ({type(exc).__name__}: {exc}). Falling back to standard download."
         )
-        # Ensure temporary file is closed and cleaned before fallback
         if file_handle:
             try:
                 file_handle.close()
@@ -392,5 +453,5 @@ async def fast_download(
             except Exception:
                 pass
         # Stop all worker sessions cleanly
-        for w in workers:
-            await w.stop()
+        if workers:
+            await asyncio.gather(*(w.stop() for w in workers), return_exceptions=True)

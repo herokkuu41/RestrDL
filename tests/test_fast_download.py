@@ -11,8 +11,9 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
-from pyrogram.errors import FileReferenceExpired, AuthKeyDuplicated, FloodWait
+from pyrogram.errors import FileReferenceExpired, AuthKeyDuplicated, FloodWait, AuthBytesInvalid
 from pyrogram import raw
+import pyrogram
 
 from config import PyroConf
 import main
@@ -357,3 +358,206 @@ def test_resolve_destination_path():
     # Default None
     p3 = resolve_destination_path(MagicMock(id=30), None, "audio", None)
     assert p3.endswith("audio_30.mp3")
+
+
+# --- 13. StopTransmission cleanly cancels download ---
+@pytest.mark.asyncio
+async def test_stop_transmission_cancels_cleanly():
+    file_size = 15 * CHUNK_SIZE
+    msg = DummyMessage(media_type="video", file_size=file_size)
+    client = make_dummy_client()
+
+    async def stopping_progress(current, total):
+        if current > 0:
+            raise pyrogram.StopTransmission()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest_file = os.path.join(tmpdir, "stopped.mp4")
+
+        with patch.object(MTProtoWorkerSession, "start", new_callable=AsyncMock), \
+             patch.object(MTProtoWorkerSession, "fetch_chunk", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(MTProtoWorkerSession, "stop", new_callable=AsyncMock):
+
+            mock_fetch.return_value = b"A" * CHUNK_SIZE
+
+            res = await fast_download(
+                client=client,
+                message=msg,
+                file_name=dest_file,
+                progress=stopping_progress,
+                num_workers=2
+            )
+
+            assert res is None
+            assert not os.path.exists(dest_file)
+
+
+# --- 14. Chunk Size Mismatch Triggers Fallback ---
+@pytest.mark.asyncio
+async def test_chunk_size_mismatch_triggers_fallback():
+    file_size = 15 * CHUNK_SIZE
+    msg = DummyMessage(media_type="video", file_size=file_size)
+    client = make_dummy_client()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest_file = os.path.join(tmpdir, "mismatch.mp4")
+
+        with patch.object(MTProtoWorkerSession, "start", new_callable=AsyncMock), \
+             patch.object(MTProtoWorkerSession, "fetch_chunk", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(MTProtoWorkerSession, "stop", new_callable=AsyncMock):
+
+            # Return truncated chunk (500 bytes instead of 1MB)
+            mock_fetch.return_value = b"A" * 500
+
+            res = await fast_download(client, msg, file_name=dest_file, num_workers=2)
+
+            assert msg.download_called
+            assert res == dest_file
+            assert os.path.exists(dest_file)
+            with open(dest_file, "rb") as f:
+                assert f.read() == b"fallback_payload"
+
+
+# --- 15. Incomplete Download Triggers Fallback ---
+@pytest.mark.asyncio
+async def test_incomplete_download_triggers_fallback():
+    file_size = 15 * CHUNK_SIZE
+    msg = DummyMessage(media_type="video", file_size=file_size)
+    client = make_dummy_client()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest_file = os.path.join(tmpdir, "incomplete.mp4")
+
+        with patch.object(MTProtoWorkerSession, "start", new_callable=AsyncMock), \
+             patch.object(MTProtoWorkerSession, "fetch_chunk", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(MTProtoWorkerSession, "stop", new_callable=AsyncMock):
+
+            # Drain queue immediately or return early
+            mock_fetch.return_value = b"A" * CHUNK_SIZE
+
+            with patch("helpers.fast_download.CHUNK_SIZE", 2 * CHUNK_SIZE):
+                res = await fast_download(client, msg, file_name=dest_file, num_workers=2)
+
+            assert msg.download_called
+            assert res == dest_file
+
+
+# --- 16. Foreign DC AuthBytesInvalid Retry ---
+@pytest.mark.asyncio
+async def test_foreign_dc_auth_bytes_invalid_retry():
+    client = make_dummy_client()
+    # Main DC is 2, worker session connects to foreign DC 4
+    client.storage.dc_id = AsyncMock(return_value=2)
+
+    worker = MTProtoWorkerSession(client, dc_id=4)
+
+    mock_session = MagicMock()
+    mock_session.start = AsyncMock()
+    mock_session.stop = AsyncMock()
+
+    call_count = 0
+    async def mock_import_auth(query):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise AuthBytesInvalid("Invalid auth bytes on first attempt")
+        return MagicMock()
+
+    mock_session.invoke = AsyncMock(side_effect=mock_import_auth)
+
+    with patch("helpers.fast_download.Session", return_value=mock_session), \
+         patch("helpers.fast_download.Auth") as mock_auth_cls:
+
+        mock_auth_instance = MagicMock()
+        mock_auth_instance.create = AsyncMock(return_value=b"new_key" * 32)
+        mock_auth_cls.return_value = mock_auth_instance
+
+        # ExportAuthorization mock return
+        client.invoke.return_value = MagicMock(id=1, bytes=b"auth_bytes")
+
+        await worker.start()
+
+        # Confirms it retried and invoked ImportAuthorization twice
+        assert call_count == 2
+        assert mock_session.start.call_count == 1
+
+
+# --- 17. Transient Chunk Error Retries Successfully ---
+@pytest.mark.asyncio
+async def test_transient_chunk_error_retries_successfully():
+    file_size = 12 * CHUNK_SIZE
+    msg = DummyMessage(media_type="video", file_size=file_size)
+    client = make_dummy_client()
+
+    call_count = 0
+    async def transient_fetch(location=None, offset_bytes=0, limit=0, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # First chunk fetch fails with timeout once, then succeeds
+        if call_count == 1:
+            raise TimeoutError("Temporary MTProto timeout")
+        await asyncio.sleep(0.001)
+        return b"Z" * CHUNK_SIZE
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest_file = os.path.join(tmpdir, "transient_ok.mp4")
+
+        with patch.object(MTProtoWorkerSession, "start", new_callable=AsyncMock), \
+             patch.object(MTProtoWorkerSession, "fetch_chunk", side_effect=transient_fetch), \
+             patch.object(MTProtoWorkerSession, "stop", new_callable=AsyncMock):
+
+            res = await fast_download(client, msg, file_name=dest_file, num_workers=2)
+
+            # Did NOT fall back because retry succeeded!
+            assert not msg.download_called
+            assert res == dest_file
+            assert os.path.exists(dest_file)
+            assert os.path.getsize(dest_file) == file_size
+
+
+# --- 18. Asymmetric Crash Cancels Peer Workers Cleanly ---
+@pytest.mark.asyncio
+async def test_asymmetric_crash_cancels_peer_workers():
+    file_size = 12 * CHUNK_SIZE
+    msg = DummyMessage(media_type="video", file_size=file_size)
+    client = make_dummy_client()
+
+    captured_tasks = []
+    orig_create_task = asyncio.create_task
+
+    def track_task(coro):
+        t = orig_create_task(coro)
+        captured_tasks.append(t)
+        return t
+
+    async def failing_fetch(location=None, offset_bytes=0, limit=0, *args, **kwargs):
+        if offset_bytes == 0:
+            # Fatal error on worker 1 after all retries
+            raise ConnectionResetError("Fatal connection reset")
+        # Worker 2 is slow
+        await asyncio.sleep(1.0)
+        return b"X" * CHUNK_SIZE
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest_file = os.path.join(tmpdir, "asym_test.mp4")
+
+        with patch("asyncio.create_task", side_effect=track_task), \
+             patch.object(MTProtoWorkerSession, "start", new_callable=AsyncMock), \
+             patch.object(MTProtoWorkerSession, "fetch_chunk", side_effect=failing_fetch), \
+             patch.object(MTProtoWorkerSession, "stop", new_callable=AsyncMock):
+
+            res = await fast_download(client, msg, file_name=dest_file, num_workers=2)
+
+            # Fallback was executed
+            assert msg.download_called
+            assert res == dest_file
+
+            # Verify that peer worker tasks were cancelled and are not dangling
+            assert len(captured_tasks) == 2
+            for t in captured_tasks:
+                assert t.done()
+                if not t.cancelled():
+                    exc = t.exception()
+                    if exc:
+                        assert isinstance(exc, ConnectionResetError)
+
