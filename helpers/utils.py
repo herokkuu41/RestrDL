@@ -28,6 +28,7 @@ from helpers.files import (
 )
 
 from helpers.msg import get_parsed_msg
+from helpers.fast_download import fast_download
 from logger import LOGGER
 
 
@@ -435,7 +436,9 @@ async def send_media(
 
 async def download_single_media(msg, progress_message, start_time):
     try:
-        media_path = await msg.download(
+        media_path = await fast_download(
+            client=getattr(msg, "_client", None),
+            message=msg,
             progress=progress_for_pyrogram,
             progress_args=progressArgs(
                 "📥 Downloading Progress",

@@ -41,3 +41,7 @@ class PyroConf(object):
 
     # How long an error message stays visible before the bot deletes it again.
     ERROR_MESSAGE_TTL = int(getenv("ERROR_MESSAGE_TTL", "300"))
+
+    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "3"))
+    MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
+

@@ -31,6 +31,7 @@ from helpers.msg import (
     get_file_name,
     get_parsed_msg
 )
+from helpers.fast_download import fast_download
 
 from config import PyroConf
 from logger import LOGGER
@@ -43,7 +44,7 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1,
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -52,7 +53,7 @@ user = Client(
     "user_session",
     workers=100,
     session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1,
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -625,6 +626,10 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
     if abort_event and abort_event.is_set():
         return "aborted"
 
+    global download_semaphore
+    if download_semaphore is None:
+        download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
+
     async with download_semaphore:
         if abort_event and abort_event.is_set():
             return "aborted"
@@ -703,18 +708,24 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 download_path = get_download_path(message.id, filename)
 
                 try:
-                    media_path = await chat_message.download(
+                    media_path = await fast_download(
+                        client=user,
+                        message=chat_message,
                         file_name=download_path,
                         progress=progress_func,
                         progress_args=prog_args,
+                        abort_event=abort_event,
                     )
                 except FileReferenceExpired:
                     LOGGER(__name__).info(f"File reference expired for {post_url}, refetching message and retrying download once.")
                     chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
-                    media_path = await chat_message.download(
+                    media_path = await fast_download(
+                        client=user,
+                        message=chat_message,
                         file_name=download_path,
                         progress=progress_func,
                         progress_args=prog_args,
+                        abort_event=abort_event,
                     )
 
                 if not media_path or not os.path.exists(media_path):
