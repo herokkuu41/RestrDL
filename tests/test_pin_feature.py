@@ -910,6 +910,41 @@ async def test_error_cleanup_survives_killall():
         await drain_tasks()
 
 
+async def test_download_fallback_pin():
+    """When cloning is blocked (protected/restricted), the first downloaded post is pinned."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    del CHAT_MESSAGE_DOWNLOADS[:]
+    MESSAGE_IS_PHOTO[0] = True
+    refusal = Exception("CHAT_FORWARDS_RESTRICTED")
+    bot.copy_error = refusal
+    user_client.copy_error = refusal
+    runner = await start_prompt(bot, user_client, count=2, start_id=100)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=10)
+        assert CHAT_MESSAGE_DOWNLOADS, "nothing was downloaded"
+        assert pins(), "downloaded post was not pinned"
+        assert not bot_said("could not pin"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_auth_key_duplicated_halts_gracefully():
+    """AUTH_KEY_DUPLICATED halts the batch immediately with an actionable warning."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    from pyrogram.errors import AuthKeyDuplicated
+    user_client.fetch_error = AuthKeyDuplicated()
+    runner = await start_prompt(bot, user_client, count=5, start_id=100)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert bot_said("AUTH_KEY_DUPLICATED"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
 TESTS = [
     test_prompt_appears_and_blocks_batch,
     test_yes_pins_first_post_once,
@@ -937,6 +972,8 @@ TESTS = [
     test_protected_source_skips_pointless_clone_attempts,
     test_killall_stops_the_batch_instead_of_failing_it,
     test_error_cleanup_survives_killall,
+    test_download_fallback_pin,
+    test_auth_key_duplicated_halts_gracefully,
 ]
 
 

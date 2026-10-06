@@ -7,7 +7,7 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, FileReferenceExpired
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, FileReferenceExpired, AuthKeyDuplicated
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -143,39 +143,90 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
         return False
 
     msg_id = getattr(decision.get("first_msg"), "id", None) or decision.get("first_msg_id")
-    bot_client, chat_id = pin_target(decision)
-    both_sides = bool(decision.get("private"))
-    if not msg_id or chat_id is None or bot_client is None:
+    primary_client, primary_chat_id = pin_target(decision)
+    if not msg_id or primary_chat_id is None or primary_client is None:
         return False
 
-    LOGGER(__name__).info(f"Pinning first batch post: chat={chat_id} message={msg_id}")
+    is_private = bool(decision.get("private"))
+    LOGGER(__name__).info(f"Pinning first batch post: primary_chat={primary_chat_id} message={msg_id}")
     decision["pinning"] = True
-    try:
-        # Either client may have made the copy and their chat ids differ in a private
-        # chat, so confirm the id really lives in the chat we are about to pin in.
-        # Otherwise Telegram answers 400 MESSAGE_ID_INVALID.
+
+    # Build prioritized list of pin attempts: (client, chat_id, both_sides)
+    attempts = []
+    # 1. Primary target with both_sides (as configured)
+    attempts.append((primary_client, primary_chat_id, is_private))
+    # 2. Primary target with both_sides=False (Telegram allows single-side pin in bot chats)
+    if is_private:
+        attempts.append((primary_client, primary_chat_id, False))
+        # 3. Fallback to alternate client in private chat (user <-> bot fallback)
+        alt_client = user if primary_client == decision.get("bot") else decision.get("bot")
+        alt_chat = decision.get("user_chat_id") if alt_client == user else decision.get("chat_id")
+        if alt_client and alt_chat:
+            attempts.append((alt_client, alt_chat, True))
+            attempts.append((alt_client, alt_chat, False))
+    else:
+        # Channel/group fallback: if bot failed, try user session if available
+        if primary_client == decision.get("bot") and user:
+            attempts.append((user, primary_chat_id, False))
+
+    pin_success = False
+    last_err = None
+    pinned_client = primary_client
+    pinned_chat = primary_chat_id
+    pinned_mid = msg_id
+
+    seen_attempts = set()
+    for client, chat_id, both_sides in attempts:
+        attempt_key = (id(client), chat_id, both_sides)
+        if attempt_key in seen_attempts:
+            continue
+        seen_attempts.add(attempt_key)
+
         try:
-            existing = await bot_client.get_messages(chat_id=chat_id, message_ids=msg_id)
-        except Exception as lookup_error:
-            LOGGER(__name__).info(f"Pre-pin lookup {msg_id} in {chat_id} failed: {lookup_error}")
-            existing = None
-        if existing is None or getattr(existing, "empty", False):
-            raise Exception(
-                f"[400 MESSAGE_ID_INVALID] message {msg_id} is not in chat {chat_id} - "
-                "the first post of this batch was not delivered there"
+            try:
+                existing = await client.get_messages(chat_id=chat_id, message_ids=msg_id)
+            except Exception as lookup_error:
+                LOGGER(__name__).info(f"Pre-pin lookup {msg_id} in {chat_id} failed: {lookup_error}")
+                existing = None
+
+            if existing is not None and getattr(existing, "empty", False):
+                raise Exception(
+                    f"[400 MESSAGE_ID_INVALID] message {msg_id} is not in chat {chat_id} - "
+                    "the first post of this batch was not delivered there"
+                )
+
+            await client.pin_chat_message(
+                chat_id, msg_id, disable_notification=True, both_sides=both_sides
             )
-        await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True,
-                                          both_sides=both_sides)
-    except Exception as e:
+            pin_success = True
+            pinned_client = client
+            pinned_chat = chat_id
+            pinned_mid = msg_id
+            LOGGER(__name__).info(f"Pinned first post of batch: chat={chat_id} message={msg_id} (both_sides={both_sides})")
+            break
+        except Exception as e:
+            last_err = e
+            LOGGER(__name__).warning(f"Could not pin message {msg_id} in chat {chat_id} (both_sides={both_sides}): {e}")
+
+    if pin_success:
+        decision["pinning"] = False
+        decision["pinned"] = True
+        decision["pinned_in"] = (pinned_client, pinned_chat, pinned_mid)
+        if notify:
+            try:
+                await notify("📌 **Pinned** the first post of this batch.")
+            except Exception:
+                pass
+        return True
+    else:
         decision["pinning"] = False
         decision["pin_failed"] = True
-        LOGGER(__name__).warning(f"Could not pin message {msg_id} in chat {chat_id}: {e}")
         send = error_notify or notify
         if send:
             try:
                 await send(
                     "⚠️ **Could not pin the first post of this batch.**\n"
-                    f"**Telegram said:** `{e}`\n\n"
+                    f"**Telegram said:** `{last_err}`\n\n"
                     "• For a channel/group destination the bot must be an **admin** there with "
                     "the **Pin messages** permission."
                 )
@@ -183,28 +234,25 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
                 pass
         return False
 
-    decision["pinning"] = False
-    decision["pinned"] = True
-    decision["pinned_in"] = (bot_client, chat_id, msg_id)
-    LOGGER(__name__).info(f"Pinned first post of batch: chat={chat_id} message={msg_id}")
-    if notify:
-        try:
-            await notify("📌 **Pinned** the first post of this batch.")
-        except Exception:
-            pass
-    return True
-
 
 async def unpin_first_post(decision: dict, notify=None) -> bool:
     """Undo the pin when the user changes their mind while the batch is running."""
     if not decision.get("pinned"):
         return False
     client, chat_id, msg_id = decision.get("pinned_in") or (
-        decision["bot"], decision["chat_id"], decision["first_msg_id"])
+        decision.get("bot"), decision.get("chat_id"), decision.get("first_msg_id"))
     try:
         await client.unpin_chat_message(chat_id, msg_id)
     except Exception as e:
         LOGGER(__name__).warning(f"Could not unpin the first batch post: {e}")
+        if decision.get("private"):
+            alt_client = user if client == decision.get("bot") else decision.get("bot")
+            alt_chat = decision.get("user_chat_id") if alt_client == user else decision.get("chat_id")
+            if alt_client and alt_chat:
+                try:
+                    await alt_client.unpin_chat_message(alt_chat, msg_id)
+                except Exception:
+                    pass
         return False
 
     decision["pinned"] = False
@@ -405,7 +453,11 @@ async def try_clone(bot: Client, chat_message, chat_id, message_id,
             errors.append(f"{name}: empty result")
         except FloodWait:
             raise
+        except AuthKeyDuplicated:
+            raise
         except Exception as e:
+            if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                raise AuthKeyDuplicated(e)
             LOGGER(__name__).info(f"{name} failed for {ids}: {e}")
             errors.append(f"{name}: {e}")
 
@@ -631,6 +683,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "sent_by": "bot",
                     "clone_errors": clone_errors,
                 }
 
@@ -674,12 +727,14 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
                 file_size = os.path.getsize(media_path)
                 if file_size == 0:
+                    cleanup_download(media_path)
+                    if abort_event and abort_event.is_set():
+                        return "aborted"
                     if progress_message:
                         await progress_message.edit("**❌ Download failed: File is empty**")
                         schedule_delete(progress_message)
                     else:
                         await reply_temporary(message, "**❌ Download failed: File is empty**")
-                    cleanup_download(media_path)
                     return "error"
 
                 LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
@@ -705,6 +760,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "sent_by": "bot",
                     "clone_errors": clone_errors,
                 }
 
@@ -714,6 +770,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": sent_msg.id,
+                    "sent_by": "bot",
                     "clone_errors": clone_errors,
                 }
             else:
@@ -726,6 +783,22 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             if abort_event and not abort_event.is_set():
                 abort_event.set() # Trigger global shut down
                 await reply_temporary(message, f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. Process Aborted.")
+            if progress_message:
+                await progress_message.delete()
+            return "aborted"
+
+        except AuthKeyDuplicated as e:
+            if abort_event and not abort_event.is_set():
+                abort_event.set()
+                await reply_temporary(
+                    message,
+                    "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n\n"
+                    "Telegram invalidated this session because the same `SESSION_STRING` was used in more than one place simultaneously.\n\n"
+                    "**To fix this:**\n"
+                    "1. Ensure the bot is only running in ONE place (stop local script or duplicate workload).\n"
+                    "2. Generate a fresh session string via @SmartUtilBot.\n"
+                    "3. Update `SESSION_STRING` in your environment and restart."
+                )
             if progress_message:
                 await progress_message.delete()
             return "aborted"
@@ -746,6 +819,22 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if abort_event and not abort_event.is_set():
                     abort_event.set()
                     await reply_temporary(message, f"🚨 **FloodWait Triggered!**\nProcess Aborted.")
+                if progress_message:
+                    await progress_message.delete()
+                return "aborted"
+
+            if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                if abort_event and not abort_event.is_set():
+                    abort_event.set()
+                    await reply_temporary(
+                        message,
+                        "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n\n"
+                        "Telegram invalidated this session because the same `SESSION_STRING` was used in more than one place simultaneously.\n\n"
+                        "**To fix this:**\n"
+                        "1. Ensure the bot is only running in ONE place (stop local script or duplicate workload).\n"
+                        "2. Generate a fresh session string via @SmartUtilBot.\n"
+                        "3. Update `SESSION_STRING` in your environment and restart."
+                    )
                 if progress_message:
                     await progress_message.delete()
                 return "aborted"
@@ -943,6 +1032,18 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     pin_decision["private"] = pin_decision["user_chat_id"] != pin_decision["chat_id"]
     pin_decision["batch_started"] = True
 
+    async def record_and_pin_first(res):
+        """Immediately record the first uploaded post and pin it right away without waiting for the batch chunk to finish."""
+        if isinstance(res, dict) and res.get("status") == "success" and res.get("sent_msg_id"):
+            if not pin_decision.get("first_msg_id"):
+                pin_decision["first_msg_id"] = res["sent_msg_id"]
+                pin_decision["first_msg"] = res.get("sent_msg")
+                pin_decision["first_sender"] = res.get("sent_by") or "bot"
+                if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
+                        and not pin_decision.get("pin_failed"):
+                    await pin_first_post(pin_decision, notify=message.reply,
+                                         error_notify=lambda text: reply_temporary(message, text))
+
     async def consume_results(results):
         """Tally a finished chunk and pin the first uploaded post exactly once."""
         nonlocal downloaded, failed, cancelled
@@ -983,7 +1084,25 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
             abort_event.set()
             break
+        except AuthKeyDuplicated:
+            await reply_temporary(
+                message,
+                "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n"
+                "Telegram invalidated this session because the same `SESSION_STRING` was used elsewhere simultaneously.\n"
+                "Please generate a new `SESSION_STRING` with @SmartUtilBot and ensure only one instance is running."
+            )
+            abort_event.set()
+            break
         except Exception as e:
+            if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                await reply_temporary(
+                    message,
+                    "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n"
+                    "Telegram invalidated this session because the same `SESSION_STRING` was used elsewhere simultaneously.\n"
+                    "Please generate a new `SESSION_STRING` with @SmartUtilBot and ensure only one instance is running."
+                )
+                abort_event.set()
+                break
             if "FLOOD_WAIT" in str(e).upper():
                  await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**")
                  abort_event.set()
@@ -1022,14 +1141,19 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 skipped += 1
                 continue
 
+            async def run_and_track_task(coro):
+                res = await coro
+                await record_and_pin_first(res)
+                return res
+
             url = f"{prefix}/{chat_msg.id}"
-            task = track_task(handle_download(
+            task = track_task(run_and_track_task(handle_download(
                 bot, message, url, 
                 silent=False, 
                 pre_fetched_msg=chat_msg, 
                 abort_event=abort_event, # Pass the global abort flag
                 clone_notice=clone_notice
-            ))
+            )))
             batch_tasks.append(task)
 
             if len(batch_tasks) >= BATCH_SIZE:
