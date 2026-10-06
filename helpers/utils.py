@@ -1,14 +1,10 @@
 import os
 import shutil
-import asyncio
 import time
 import math
-from typing import Optional
 from asyncio.subprocess import PIPE
 from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
 
-from pyrogram.parser import Parser
-from pyrogram.utils import get_channel_id
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -16,19 +12,18 @@ from pyrogram.types import (
     InputMediaVideo,
     InputMediaDocument,
     InputMediaAudio,
-    Voice,
 )
 from pyrogram.errors import MessageNotModified
 
 from helpers.files import (
     fileSizeLimit,
-    cleanup_download,
     get_readable_file_size,
     get_readable_time
 )
 
 from helpers.msg import get_parsed_msg
 from helpers.fast_download import fast_download
+from helpers.transfer import relay_album
 from logger import LOGGER
 
 
@@ -468,63 +463,18 @@ async def download_single_media(msg, progress_message, start_time):
     return "skip", None, None
 
 
-async def processMediaGroup(chat_message, bot, message, destination_chat_id=None):
+async def processMediaGroup(chat_message, bot, message, destination_chat_id=None,
+                            source_client=None, abort_event=None):
     media_group_messages = await chat_message.get_media_group()
-
-    valid_media = []
-    temp_paths = []
-    invalid_paths = []
-
-    target_chat_id = destination_chat_id or message.chat.id
-    start_time = time.time()
-
-    progress_message = await message.reply(
-        f"📥 Downloading media group... ({len(media_group_messages)} files)"
-    )
-
-    download_tasks = [
-        download_single_media(msg, progress_message, start_time)
-        for msg in media_group_messages
-        if msg.photo or msg.video or msg.document or msg.audio
-    ]
-
-    results = await asyncio.gather(*download_tasks, return_exceptions=True)
-
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-
-        status, media_path, media_obj = result
-        if status == "success":
-            temp_paths.append(media_path)
-            valid_media.append(media_obj)
-
-    if valid_media:
+    source_client = source_client or getattr(chat_message, "_client", None)
+    progress_message = await message.reply(f"**Transferring album ({len(media_group_messages)} files)**")
+    try:
+        sent = await relay_album(source_client, bot, media_group_messages,
+                                 destination_chat_id or message.chat.id,
+                                 progress_message=progress_message, abort_event=abort_event)
+        return sent[0] if sent else None
+    finally:
         try:
-            sent_group = await bot.send_media_group(target_chat_id, valid_media)
             await progress_message.delete()
         except Exception:
-            sent_group = []
-            for media in valid_media:
-                try:
-                    if isinstance(media, InputMediaPhoto):
-                        sent_group.append(await bot.send_photo(target_chat_id, media.media, media.caption))
-                    elif isinstance(media, InputMediaVideo):
-                        sent_group.append(await bot.send_video(target_chat_id, media.media, caption=media.caption))
-                    elif isinstance(media, InputMediaDocument):
-                        sent_group.append(await bot.send_document(target_chat_id, media.media, caption=media.caption))
-                    elif isinstance(media, InputMediaAudio):
-                        sent_group.append(await bot.send_audio(target_chat_id, media.media, caption=media.caption))
-                except Exception:
-                    pass
-
-        for path in temp_paths + invalid_paths:
-            cleanup_download(path)
-
-        return sent_group[0] if sent_group else None
-
-    await progress_message.delete()
-    for path in invalid_paths:
-        cleanup_download(path)
-
-    return None
+            pass

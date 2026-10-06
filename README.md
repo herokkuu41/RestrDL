@@ -18,12 +18,72 @@
 - 📥 Download media (photos, videos, audio, documents).
 - ✅ Supports downloading from both single media posts and media groups.
 - 🔄 Progress bar showing real-time downloading progress.
+- ⚡ Parallel streaming downloads and uploads: upload starts as chunks arrive, without saving the full file locally.
 - ✍️ Copy text messages or captions from Telegram posts.
 - 📌 Batch mode asks whether to pin the first post of the batch (tap a button or reply `yes` / `no`).
 - 🗂️ With no destination channel set, everything (text, photos, videos, files) is delivered to the bot chat itself.
 - 🧹 Error messages delete themselves automatically after 5 minutes.
 - ☁️ **Native Python & Cloud-ready**: Runs directly on [Botkeep Cloud](https://botkeep.cloud) without requiring Docker!
 - 🎬 **Bundled FFmpeg support**: Thumbnail generation works out-of-the-box on standard Python environments.
+
+---
+
+## Streaming transfers on a 2 GB server
+
+Install the updated `requirements.txt` and restart the existing bot. The transfer engine
+uses four download and four upload connections across the entire bot, with at most two
+files active at once. Albums share these limits. Queued data, upload slices, and retry
+payloads have a shared 64 MiB budget; this is a payload budget, not a cap on total process
+RAM. TgCrypto is required and checked at startup.
+
+Uploads begin while downloads are still running. Progress shows downloaded bytes and
+bytes acknowledged by Telegram separately. Files retain captions, names, source video/
+audio metadata, and available thumbnails; streaming does not generate new FFmpeg thumbnails.
+The existing server-side copy/forward path remains the first choice when available.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `PARALLEL_DOWNLOAD_WORKERS` | 4 | Global download connection slots |
+| `PARALLEL_UPLOAD_WORKERS` | 4 | Global upload connection slots |
+| `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
+| `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
+| `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
+| `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
+
+Existing environment variables override defaults: update any old
+`PARALLEL_DOWNLOAD_WORKERS=3` value to `4` to use the new defaults. CDN streaming
+needs at least two download slots because it opens both an origin and a CDN session.
+Native disk fallback is attempted only for unsupported file identifiers when space
+can be reserved. Oversized files are rejected before downloading using the destination
+bot's upload limit (normally 2000 MiB), even when the source user has Premium.
+Failed/cancelled transfers release their buffers and connection slots. Albums are sent
+only after every item is prepared; failure does not silently send an incomplete album.
+
+### Measure real speed (optional)
+
+Stop the production bot before using its session string for the benchmark. Run from the
+repository directory with your normal credentials configured:
+
+```sh
+python -B scripts/benchmark_transfers.py --run --source https://t.me/channel/123 --target -1001234567890
+```
+
+This sends up to **three real test posts** to your chosen destination: native download/
+upload, streaming with two connections per direction, and streaming with four. The native
+baseline is skipped when disk space is insufficient. JSON results include elapsed time,
+throughput, and streaming buffer peak. Repeat with representative files before changing
+the defaults; account limits, network conditions, and Telegram throttling can dominate
+performance. Automated tests establish correctness and overlapping transfers, not a
+guaranteed real-world speed increase.
+
+### Run regression tests without modifying runtime files
+
+Install `pytest` and `pytest-asyncio` in a test environment containing `requirements.txt`.
+Run from a temporary working directory so logs/download fixtures stay outside the repo:
+
+```sh
+python -B -m pytest /absolute/path/to/RestrDL/tests --rootdir=/absolute/path/to/RestrDL -q -p no:cacheprovider
+```
 
 ---
 

@@ -4,7 +4,6 @@ import shutil
 import asyncio
 import inspect
 import uuid
-import time
 from typing import Optional, Callable, Tuple, Any
 
 import pyrogram
@@ -58,10 +57,13 @@ def get_file_location(file_id_obj: FileId) -> Any:
                 access_hash=file_id_obj.chat_access_hash
             )
         else:
-            peer = raw.types.InputPeerChannel(
-                channel_id=utils.get_channel_id(file_id_obj.chat_id),
-                access_hash=file_id_obj.chat_access_hash
-            )
+            if file_id_obj.chat_access_hash == 0:
+                peer = raw.types.InputPeerChat(chat_id=-file_id_obj.chat_id)
+            else:
+                peer = raw.types.InputPeerChannel(
+                    channel_id=utils.get_channel_id(file_id_obj.chat_id),
+                    access_hash=file_id_obj.chat_access_hash
+                )
 
         return raw.types.InputPeerPhotoFileLocation(
             peer=peer,
@@ -291,6 +293,14 @@ async def fast_download(
     progress_lock = asyncio.Lock()
     completed_successfully = False
     worker_tasks = []
+    start_tasks = []
+
+    async def stop_workers():
+        for task in start_tasks + worker_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*(start_tasks + worker_tasks), return_exceptions=True)
+        await asyncio.gather(*(w.stop() for w in workers), return_exceptions=True)
 
     try:
         # Pre-allocate sparse/zeroed temporary file
@@ -307,7 +317,14 @@ async def fast_download(
             w = MTProtoWorkerSession(client, dc_id)
             workers.append(w)
 
-        await asyncio.gather(*(w.start() for w in workers))
+        start_tasks = [asyncio.create_task(w.start()) for w in workers]
+        try:
+            await asyncio.gather(*start_tasks)
+        finally:
+            for task in start_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*start_tasks, return_exceptions=True)
 
         async def worker_loop(worker: MTProtoWorkerSession):
             nonlocal downloaded_bytes
@@ -439,6 +456,7 @@ async def fast_download(
             except Exception:
                 pass
 
+        await stop_workers()
         return await fallback_download(message, file_name, progress, progress_args, abort_event)
 
     finally:
@@ -453,5 +471,4 @@ async def fast_download(
             except Exception:
                 pass
         # Stop all worker sessions cleanly
-        if workers:
-            await asyncio.gather(*(w.stop() for w in workers), return_exceptions=True)
+        await stop_workers()

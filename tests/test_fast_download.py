@@ -129,6 +129,12 @@ def test_get_file_location_types():
     loc_chat = get_file_location(fid_chat)
     assert isinstance(loc_chat, raw.types.InputPeerPhotoFileLocation)
 
+    fid_group = FileId(file_type=FileType.CHAT_PHOTO, dc_id=2, media_id=50,
+                       chat_id=-123, chat_access_hash=0)
+    loc_group = get_file_location(fid_group)
+    assert isinstance(loc_group.peer, raw.types.InputPeerChat)
+    assert loc_group.peer.chat_id == 123
+
 
 # --- 4. Small File Fallback ---
 @pytest.mark.asyncio
@@ -553,7 +559,7 @@ async def test_asymmetric_crash_cancels_peer_workers():
             assert res == dest_file
 
             # Verify that peer worker tasks were cancelled and are not dangling
-            assert len(captured_tasks) == 2
+            assert len(captured_tasks) == 4  # startup tasks are supervised too
             for t in captured_tasks:
                 assert t.done()
                 if not t.cancelled():
@@ -561,3 +567,35 @@ async def test_asymmetric_crash_cancels_peer_workers():
                     if exc:
                         assert isinstance(exc, ConnectionResetError)
 
+
+@pytest.mark.asyncio
+async def test_startup_failure_drains_peers_before_native_fallback():
+    msg = DummyMessage(file_size=12*CHUNK_SIZE)
+    client = make_dummy_client()
+    calls = 0
+    peer_finished = asyncio.Event()
+    stop = AsyncMock()
+    original_download = msg.download
+
+    async def start():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(0)
+            raise RuntimeError("startup failed")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            peer_finished.set()
+
+    async def download(**kwargs):
+        assert peer_finished.is_set()
+        assert stop.await_count >= 2
+        return await original_download(**kwargs)
+
+    msg.download = download
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(MTProtoWorkerSession, "start", side_effect=start), \
+             patch.object(MTProtoWorkerSession, "stop", stop):
+            result = await fast_download(client, msg, file_name=os.path.join(directory, "file.bin"), num_workers=2)
+            assert result and msg.download_called

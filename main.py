@@ -7,31 +7,25 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, FileReferenceExpired, AuthKeyDuplicated
+from pyrogram.errors import PeerIdInvalid, FloodWait, AuthKeyDuplicated
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
     processMediaGroup,
-    progressArgs,
-    send_media,
-    progress_for_pyrogram,
     refresh_progress_message
 )
 
 from helpers.files import (
-    get_download_path,
     fileSizeLimit,
     get_readable_file_size,
-    get_readable_time,
-    cleanup_download
+    get_readable_time
 )
 
 from helpers.msg import (
     getChatMsgID,
-    get_file_name,
     get_parsed_msg
 )
-from helpers.fast_download import fast_download
+from helpers.transfer import relay_media, close_transfers
 
 from config import PyroConf
 from logger import LOGGER
@@ -42,7 +36,7 @@ bot = Client(
     api_id=PyroConf.API_ID,
     api_hash=PyroConf.API_HASH,
     bot_token=PyroConf.BOT_TOKEN,
-    workers=100,
+    workers=8,
     parse_mode=ParseMode.MARKDOWN,
     max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
@@ -51,7 +45,7 @@ bot = Client(
 # Client for user session
 user = Client(
     "user_session",
-    workers=100,
+    workers=8,
     session_string=PyroConf.SESSION_STRING,
     max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
@@ -673,17 +667,19 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     else chat_message.video.file_size if chat_message.video
                     else chat_message.audio.file_size
                 )
-                if not await fileSizeLimit(file_size, message, "download", user.me.is_premium):
+                if not await fileSizeLimit(file_size, message, "upload", getattr(bot.me, "is_premium", False)):
                     return "error"
 
             parsed_caption = await get_parsed_msg(chat_message.caption or "", chat_message.caption_entities)
             parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
 
             if chat_message.media_group_id:
-                sent_msg = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
+                sent_msg = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id,
+                                                  source_client=user, abort_event=abort_event)
                 if not sent_msg:
                     if not silent:
                         await reply_temporary(message, "**Could not extract any valid media from the media group.**")
+                    return "error"
                 return {
                     "status": "success",
                     "sent_msg": sent_msg,
@@ -693,76 +689,13 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 }
 
             elif chat_message.media:
-                start_time = time()
-                
                 if not silent:
-                    progress_message = await message.reply("**⏳ Initializing...**")
-                    progress_func = progress_for_pyrogram
-                    progress_action_str = f"📥 Downloading (ID: {message_id})"
-                    prog_args = progressArgs(progress_action_str, progress_message, start_time)
-                else:
-                    progress_func = None
-                    prog_args = None
+                    progress_message = await message.reply("**Starting streaming transfer...**")
 
-                filename = get_file_name(message_id, chat_message)
-                download_path = get_download_path(message.id, filename)
-
-                try:
-                    media_path = await fast_download(
-                        client=user,
-                        message=chat_message,
-                        file_name=download_path,
-                        progress=progress_func,
-                        progress_args=prog_args,
-                        abort_event=abort_event,
-                    )
-                except FileReferenceExpired:
-                    LOGGER(__name__).info(f"File reference expired for {post_url}, refetching message and retrying download once.")
-                    chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
-                    media_path = await fast_download(
-                        client=user,
-                        message=chat_message,
-                        file_name=download_path,
-                        progress=progress_func,
-                        progress_args=prog_args,
-                        abort_event=abort_event,
-                    )
-
-                if not media_path or not os.path.exists(media_path):
-                    if progress_message:
-                        await progress_message.edit("**❌ Download failed: File not saved properly**")
-                        schedule_delete(progress_message)
-                    else:
-                        await reply_temporary(message, "**❌ Download failed: File not saved properly**")
-                    return "error"
-
-                file_size = os.path.getsize(media_path)
-                if file_size == 0:
-                    cleanup_download(media_path)
-                    if abort_event and abort_event.is_set():
-                        return "aborted"
-                    if progress_message:
-                        await progress_message.edit("**❌ Download failed: File is empty**")
-                        schedule_delete(progress_message)
-                    else:
-                        await reply_temporary(message, "**❌ Download failed: File is empty**")
-                    return "error"
-
-                LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
-
-                media_type = (
-                    "photo" if chat_message.photo
-                    else "video" if chat_message.video
-                    else "audio" if chat_message.audio
-                    else "document"
-                )
-                
-                sent_msg = await send_media(
-                    bot, message, media_path, media_type, parsed_caption,
-                    progress_message, start_time, destination_chat_id=target_chat_id
-                )
-
-                cleanup_download(media_path)
+                sent_msg = await relay_media(user, bot, chat_message, target_chat_id,
+                                             progress_message=progress_message, abort_event=abort_event)
+                if not sent_msg:
+                    raise RuntimeError("Transfer did not return a sent message")
                 
                 if progress_message:
                     await progress_message.delete()
@@ -790,6 +723,14 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 return "error"
 
         # --- GLOBAL ERROR HANDLING & ABORT LOGIC ---
+        except asyncio.CancelledError:
+            if progress_message:
+                try:
+                    await progress_message.delete()
+                except Exception:
+                    pass
+            raise
+
         except FloodWait as e:
             if abort_event and not abort_event.is_set():
                 abort_event.set() # Trigger global shut down
@@ -814,7 +755,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 await progress_message.delete()
             return "aborted"
             
-        except (PeerIdInvalid, BadRequest, KeyError):
+        except (PeerIdInvalid, KeyError):
             if abort_event and abort_event.is_set(): return "aborted"
             err = f"**Error processing {post_url}: User client likely not in chat.**"
             if not silent:
@@ -1296,6 +1237,9 @@ async def cancel_all_tasks(_, message):
 
 
 async def initialize():
+    from pyrogram.crypto import aes
+    if aes.tgcrypto is None:
+        raise RuntimeError("TgCrypto is required for fast transfers; install requirements.txt")
     global download_semaphore
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
 
@@ -1342,6 +1286,10 @@ if __name__ == "__main__":
     except Exception as err:
         LOGGER(__name__).error(err)
     finally:
+        try:
+            loop.run_until_complete(close_transfers())
+        except Exception as err:
+            LOGGER(__name__).warning("Transfer shutdown: %s", err)
         if getattr(user, "is_connected", False):
             try:
                 user.stop()

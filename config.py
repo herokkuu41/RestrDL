@@ -42,6 +42,17 @@ class PyroConf(object):
     # How long an error message stays visible before the bot deletes it again.
     ERROR_MESSAGE_TTL = int(getenv("ERROR_MESSAGE_TTL", "300"))
 
-    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "3"))
+    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
+    PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "4"))
+    MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
+    TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
+    DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
+
+    for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
+                  "MAX_ACTIVE_TRANSFERS", "TRANSFER_BUFFER_MIB", "DISK_RESERVE_MIB"):
+        if locals()[_name] <= 0:
+            raise ValueError(f"{_name} must be positive")
+    if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
+        raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 

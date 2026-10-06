@@ -363,6 +363,15 @@ pyrogram.Client = FakeClient
 import main  # noqa: E402
 
 
+async def fake_relay_media(source, destination, message, target, **kwargs):
+    """Stub the byte transport; keep real handlers, destinations and pinning."""
+    CHAT_MESSAGE_DOWNLOADS.append(message.id)
+    return destination._deliver(target)
+
+
+main.relay_media = fake_relay_media
+
+
 # ----------------------------------------------------------------------
 # Test helpers
 # ----------------------------------------------------------------------
