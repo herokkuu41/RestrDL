@@ -1,0 +1,8 @@
+Pyrofork
+TgCrypto
+Pyleaves
+psutil
+pillow
+aiohttp
+python-dotenv
+imageio-ffmpeg

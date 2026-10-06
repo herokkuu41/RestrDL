@@ -1,0 +1,127 @@
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:43 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/102
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [102] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/103
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [103] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:43 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:43 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=-1009999 message=9100
+[06-Oct-26 06:35:43 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=-1009999 message=9100
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - handle_text_and_states() - Line 875: main - Pin prompt for 424242 was closed before the batch started.
+[06-Oct-26 06:35:44 PM - INFO] - handle_text_and_states() - Line 875: main - Pin prompt for 424242 was closed before the batch started.
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - WARNING] - pin_first_post() - Line 172: main - Could not pin message 9100 in chat test_bot: CHAT_ADMIN_REQUIRED
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - WARNING] - pin_first_post() - Line 172: main - Could not pin message 9100 in chat test_bot: MESSAGE_ID_INVALID
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/102
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [102] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/103
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [103] via user-forward
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - WARNING] - resolve_destination() - Line 321: main - Ignoring /set destination 424242: it is the requester's own user id (= Saved Messages for the user client). Using the bot chat instead.
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:44 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:44 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:45 PM - ERROR] - execute_batch_logic() - Line 991: main - CHANNEL_INVALID
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - user-forward failed for [100]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - user-copy failed for [100]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - bot-forward failed for [100]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - bot-copy failed for [100]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 609: main - Clone unavailable for https://t.me/testchan/100: ['user-forward: CHAT_FORWARDS_RESTRICTED', 'user-copy: CHAT_FORWARDS_RESTRICTED', 'bot-forward: CHAT_FORWARDS_RESTRICTED', 'bot-copy: CHAT_FORWARDS_RESTRICTED']
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 685: main - Downloaded media: downloads\559\100.jpg (Size: 7 bytes)
+[06-Oct-26 06:35:45 PM - INFO] - cleanup_download() - Line 19: helpers.files - Cleaning Download: downloads\559\100.jpg
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - user-forward failed for [101]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - user-copy failed for [101]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - bot-forward failed for [101]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 409: main - bot-copy failed for [101]: CHAT_FORWARDS_RESTRICTED
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 609: main - Clone unavailable for https://t.me/testchan/101: ['user-forward: CHAT_FORWARDS_RESTRICTED', 'user-copy: CHAT_FORWARDS_RESTRICTED', 'bot-forward: CHAT_FORWARDS_RESTRICTED', 'bot-copy: CHAT_FORWARDS_RESTRICTED']
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 685: main - Downloaded media: downloads\559\101.jpg (Size: 7 bytes)
+[06-Oct-26 06:35:45 PM - INFO] - cleanup_download() - Line 19: helpers.files - Cleaning Download: downloads\559\101.jpg
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [100, 101] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/111
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [111, 112, 113, 114, 115] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [100] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:45 PM - INFO] - try_clone() - Line 403: main - Cloned [101] via user-forward
+[06-Oct-26 06:35:45 PM - INFO] - pin_first_post() - Line 151: main - Pinning first batch post: chat=test_bot message=9100
+[06-Oct-26 06:35:45 PM - INFO] - pin_first_post() - Line 189: main - Pinned first post of batch: chat=test_bot message=9100
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 609: main - Clone unavailable for https://t.me/testchan/100: ['content protection is enabled on the source chat - Telegram blocks forwarding and copying there, so the file has to be downloaded']
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 685: main - Downloaded media: downloads\571\100.jpg (Size: 7 bytes)
+[06-Oct-26 06:35:45 PM - INFO] - cleanup_download() - Line 19: helpers.files - Cleaning Download: downloads\571\100.jpg
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 609: main - Clone unavailable for https://t.me/testchan/101: ['content protection is enabled on the source chat - Telegram blocks forwarding and copying there, so the file has to be downloaded']
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 685: main - Downloaded media: downloads\571\101.jpg (Size: 7 bytes)
+[06-Oct-26 06:35:45 PM - INFO] - cleanup_download() - Line 19: helpers.files - Cleaning Download: downloads\571\101.jpg
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/100
+[06-Oct-26 06:35:45 PM - INFO] - handle_download() - Line 595: main - Processing URL: https://t.me/testchan/101
