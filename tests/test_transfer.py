@@ -3,12 +3,12 @@ import asyncio
 import hashlib
 from collections import defaultdict
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pyrogram import raw
 from pyrogram.file_id import FileId, FileType
-from pyrogram.errors import FilePartMissing, FileReferenceExpired, FloodWait, AuthKeyDuplicated
+from pyrogram.errors import FilePartMissing, FileReferenceExpired, FloodWait, FloodPremiumWait, AuthKeyDuplicated
 
 import helpers.transfer as transfer
 from helpers.transfer import CHUNK_SIZE, PART_SIZE, TransferManager, Upload
@@ -178,7 +178,8 @@ async def test_global_limits_slow_upload_and_cancel(monkeypatch):
         assert manager.budget.used <= 16*CHUNK_SIZE
         assert {i for i, _ in backend.downloaded} <= {1, 2}
         assert backend.peak["source"] <= 4 and backend.peak["bot"] <= 4
-        assert backend.rpc_peak["source"] <= 4 and backend.rpc_peak["bot"] <= 4
+        assert backend.rpc_peak["source"] <= manager.downloads.capacity
+        assert backend.rpc_peak["bot"] <= manager.uploads.capacity
         abort.set()
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
         assert all(isinstance(result, asyncio.CancelledError) for result in results)
@@ -191,7 +192,7 @@ async def test_global_limits_slow_upload_and_cancel(monkeypatch):
         await manager.close()
 
 
-@pytest.mark.parametrize("error", [FloodWait(31), AuthKeyDuplicated(), ValueError("bad chunk")])
+@pytest.mark.parametrize("error", [FloodWait(31), FloodPremiumWait(1), AuthKeyDuplicated(), ValueError("bad chunk")])
 async def test_fatal_errors_propagate_and_drain(monkeypatch, error):
     backend = Backend(monkeypatch)
     backend.error = error
@@ -494,5 +495,237 @@ async def test_small_global_buffer_cannot_deadlock_ordered_producers(monkeypatch
         ), 5)
         assert len(results) == 2
         assert manager.budget.used == 0 and manager.budget.peak <= 4*CHUNK_SIZE
+    finally:
+        await manager.close()
+
+
+async def test_real_pyrofork_sent_response_parsing():
+    """Catch the production topics error with the real TL constructor and parser."""
+    _, bot = clients()
+    bot.message_cache = {}
+    raw_message = raw.types.Message(id=101, peer_id=raw.types.PeerUser(user_id=42),
+        from_id=raw.types.PeerUser(user_id=99), date=1700000000, message="delivered", out=True, entities=[])
+    response = raw.types.Updates(updates=[raw.types.UpdateNewMessage(
+        message=raw_message, pts=1, pts_count=1)], users=[
+            raw.types.User(id=42, first_name="Target", access_hash=1, usernames=[], restriction_reason=[]),
+            raw.types.User(id=99, first_name="Bot", bot=True, access_hash=2, usernames=[], restriction_reason=[])], chats=[], date=1700000000, seq=1)
+    parsed = await transfer.sent_messages(bot, response)
+    assert len(parsed) == 1 and parsed[0].id == 101 and parsed[0].text == "delivered"
+    assert parsed[0].chat.id == 42
+
+
+async def test_pipeline_uses_multiple_rpcs_without_extra_connections(monkeypatch):
+    backend = Backend(monkeypatch)
+    backend.delay = 0.01
+    backend.size[1] = 32 * CHUNK_SIZE + 13
+    source, bot = clients()
+    manager = TransferManager(downloads=4, uploads=4, download_requests=2, upload_requests=4)
+    backend.gate = asyncio.Event()
+    task = asyncio.create_task(manager.prepare(source, bot, message(backend.size[1])))
+    try:
+        for _ in range(100):
+            if backend.rpc_peak["bot"] == 16:
+                break
+            await asyncio.sleep(0.005)
+        assert 4 < backend.rpc_peak["source"] <= 8
+        assert 4 < backend.rpc_peak["bot"] <= 16
+        assert backend.peak["source"] == backend.peak["bot"] == 4
+        backend.gate.set()
+        upload = await asyncio.wait_for(task, 2)
+        assert manager.budget.peak <= manager.budget.limit
+        assert b"".join(data for _, data in sorted(backend.parts[upload.file.id].items())) == backend.payload(backend.size[1])
+    finally:
+        backend.gate.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.close()
+
+
+async def test_large_file_slow_first_chunk_does_not_block_upload(monkeypatch):
+    backend = Backend(monkeypatch)
+    backend.size[1] = 12 * CHUNK_SIZE
+    source, bot = clients()
+    manager = TransferManager()
+    original = manager.fetch
+    first_chunk = asyncio.Event()
+
+    async def fetch(source, fid, offset, expected):
+        if offset == 0:
+            await first_chunk.wait()
+        return await original(source, fid, offset, expected)
+
+    monkeypatch.setattr(manager, "fetch", fetch)
+    task = asyncio.create_task(manager.prepare(source, bot, message(backend.size[1])))
+    try:
+        for _ in range(100):
+            if any(backend.parts.values()):
+                break
+            await asyncio.sleep(0.005)
+        assert any(backend.parts.values()), "other chunks must upload before the slow first chunk"
+        assert not task.done()
+        first_chunk.set()
+        result = await asyncio.wait_for(task, 2)
+        assert b"".join(data for _, data in sorted(backend.parts[result.file.id].items())) == backend.payload(backend.size[1])
+    finally:
+        first_chunk.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.close()
+
+
+async def test_progress_edit_cannot_stall_data_workers(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: clock[0])
+    gate = asyncio.Event()
+    reporter = transfer.TransferProgress(NS(edit=AsyncMock(side_effect=lambda *a, **kw: None)))
+    async def edit(*args, **kwargs):
+        await gate.wait()
+    reporter.message.edit = edit
+    clock[0] = 5
+    task = asyncio.create_task(reporter("one", CHUNK_SIZE, PART_SIZE, 2 * CHUNK_SIZE))
+    await asyncio.sleep(0)
+    try:
+        await asyncio.wait_for(reporter("one", 2 * CHUNK_SIZE, CHUNK_SIZE, 2 * CHUNK_SIZE), 0.1)
+        assert reporter.states["one"][0] == 2 * CHUNK_SIZE
+    finally:
+        gate.set()
+        await task
+
+
+async def test_pool_switch_waits_for_all_pipelined_rpcs(monkeypatch):
+    backend = Backend(monkeypatch)
+    source, _ = clients()
+    pool = transfer.ConnectionPool(1, requests=3)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    async def hold():
+        async with pool.lease(source, 2):
+            entered.set()
+            await gate.wait()
+    task = asyncio.create_task(hold())
+    await entered.wait()
+    async def switch():
+        async with pool.lease(source, 4) as worker:
+            assert worker.dc == 4
+    switching = asyncio.create_task(switch())
+    try:
+        await asyncio.sleep(0.01)
+        assert not switching.done() and backend.live["source"] == 1
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(task, switching), 2)
+        assert backend.peak["source"] == 1
+        assert pool.available.qsize() == 3
+    finally:
+        gate.set()
+        await asyncio.gather(task, switching, return_exceptions=True)
+        await pool.close()
+
+
+async def test_broken_rpc_does_not_close_session_used_by_sibling(monkeypatch):
+    backend = Backend(monkeypatch)
+    source, _ = clients()
+    pool = transfer.ConnectionPool(1, requests=2)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    async def sibling():
+        async with pool.lease(source, 2):
+            entered.set()
+            await gate.wait()
+            assert backend.live["source"] == 1
+    task = asyncio.create_task(sibling())
+    await entered.wait()
+    try:
+        with pytest.raises(ConnectionError):
+            async with pool.lease(source, 2):
+                raise ConnectionError("failed request")
+        assert backend.live["source"] == 1
+        gate.set()
+        await task
+        assert backend.live["source"] == 0
+        assert pool.available.qsize() == 2
+    finally:
+        gate.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await pool.close()
+
+
+async def test_foreign_dc_authorization_is_shared_by_media_connections(monkeypatch):
+    import helpers.fast_download as download
+    source = NS(storage=NS(dc_id=AsyncMock(return_value=2), test_mode=AsyncMock(return_value=False)),
+        invoke=AsyncMock(return_value=NS(id=7, bytes=b"authorization")))
+    create = AsyncMock(return_value=b"K" * 256)
+    monkeypatch.setattr(download, "Auth", MagicMock(return_value=NS(create=create)))
+    sessions = []
+    def session(*args, **kwargs):
+        assert args[2] == b"K" * 256 and kwargs["is_media"] is True
+        worker = NS(start=AsyncMock(), stop=AsyncMock(), invoke=AsyncMock(return_value=True))
+        sessions.append(worker)
+        return worker
+    monkeypatch.setattr(download, "Session", session)
+    pool = transfer.ConnectionPool(4)
+    all_entered = asyncio.Event()
+    entered = 0
+    async def lease():
+        nonlocal entered
+        async with pool.lease(source, 4):
+            entered += 1
+            if entered == 4:
+                all_entered.set()
+            await all_entered.wait()
+    try:
+        await asyncio.wait_for(transfer.supervised([lease() for _ in range(4)]), 2)
+        create.assert_awaited_once()
+        source.invoke.assert_awaited_once()
+        assert sum(worker.invoke.await_count for worker in sessions) == 1
+        assert len(sessions) == 4
+    finally:
+        await pool.close()
+
+
+async def test_album_copy_uses_existing_ids_and_topics_safe_parser(monkeypatch):
+    _, bot = clients()
+    messages = [message(CHUNK_SIZE, i) for i in (3, 1, 2)]
+    bot.get_media_group = AsyncMock(return_value=messages)
+    parsed = []
+    async def parse(client, response):
+        assert response.topics == []
+        return [NS(id=sent.id) for sent in response.messages]
+    monkeypatch.setattr(transfer.utils, "parse_messages", parse)
+    async def invoke(query):
+        assert [item.media.id.id for item in query.multi_media] == [1, 2, 3]
+        assert all(item.message == "caption" for item in query.multi_media)
+        updates = [raw.types.UpdateNewMessage(message=raw.types.MessageEmpty(id=i), pts=1, pts_count=1)
+            for i in (103, 101, 102)]
+        return NS(updates=updates, users=[], chats=[])
+    bot.invoke = AsyncMock(side_effect=invoke)
+    parsed = await transfer.copy_album(bot, 123, -100123, 2)
+    assert [message.id for message in parsed] == [101, 102, 103]
+
+
+@pytest.mark.parametrize("connections", [2, 4])
+async def test_cdn_and_regular_file_share_small_memory_budget(monkeypatch, connections):
+    backend = Backend(monkeypatch)
+    source, bot = clients()
+    size = 12 * CHUNK_SIZE + 5
+    backend.size[1] = backend.size[2] = size
+    manager = TransferManager(downloads=connections, uploads=4, active=2, buffer_mib=8)
+    fetch = manager.fetch
+    async def cdn_or_regular(source, fid, offset, expected):
+        if fid.media_id == 1:
+            raise transfer.CdnRedirect()
+        return await fetch(source, fid, offset, expected)
+    monkeypatch.setattr(manager, "fetch", cdn_or_regular)
+    async def stream(encoded):
+        for offset in range(0, size, CHUNK_SIZE):
+            await asyncio.sleep(0.001)
+            yield backend.data(offset, min(CHUNK_SIZE, size - offset))
+    source.stream_media = stream
+    try:
+        results = await asyncio.wait_for(transfer.supervised([
+            manager.prepare(source, bot, message(size, 1)),
+            manager.prepare(source, bot, message(size, 2))]), 3)
+        for upload in results:
+            assert b"".join(data for _, data in sorted(backend.parts[upload.file.id].items())) == backend.payload(size)
+        assert manager.budget.used == 0 and manager.budget.peak <= 8 * CHUNK_SIZE
     finally:
         await manager.close()

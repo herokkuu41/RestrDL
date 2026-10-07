@@ -372,6 +372,13 @@ async def fake_relay_media(source, destination, message, target, **kwargs):
 main.relay_media = fake_relay_media
 
 
+async def fake_copy_album(client, target, source_chat, message_id):
+    return await client.copy_media_group(target, source_chat, message_id)
+
+
+main.copy_album = fake_copy_album
+
+
 # ----------------------------------------------------------------------
 # Test helpers
 # ----------------------------------------------------------------------
@@ -950,6 +957,62 @@ async def test_auth_key_duplicated_halts_gracefully():
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
         assert bot_said("AUTH_KEY_DUPLICATED"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_pin_waits_for_first_source_media_instead_of_fast_fourth_text(monkeypatch):
+    """Reproduce the screenshot: earlier media transfer, later text finishes first."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    gate = asyncio.Event()
+    later_sent = asyncio.Event()
+    monkeypatch.setattr(main.PyroConf, "BATCH_SIZE", 4)
+
+    async def download(bot, incoming, url, **kwargs):
+        source_id = kwargs["pre_fetched_msg"].id
+        if source_id == 100:
+            await gate.wait()
+        sent = bot._deliver(USER_ID, source_id=source_id)
+        if source_id == 103:
+            later_sent.set()
+        return {"status": "success", "sent_msg": sent, "sent_msg_id": sent.id, "sent_by": "bot"}
+
+    monkeypatch.setattr(main, "handle_download", download)
+    decision = main.new_pin_decision()
+    decision["pin_first"] = True
+    runner = asyncio.create_task(main.execute_batch_logic(
+        bot, IncomingMessage("4"), "https://t.me/testchan/100", 4, decision))
+    try:
+        await asyncio.wait_for(later_sent.wait(), 2)
+        assert pins() == [], "the fourth post stole the first post's pin"
+        gate.set()
+        await asyncio.wait_for(runner, 2)
+        assert pins() == [(USER_ID, 9100)]
+        assert bot_said("**processed** : `4`")
+    finally:
+        gate.set()
+        await drain_tasks()
+
+
+async def test_pin_chooses_earliest_success_after_first_source_fails(monkeypatch):
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    monkeypatch.setattr(main.PyroConf, "BATCH_SIZE", 4)
+    async def download(bot, incoming, url, **kwargs):
+        source_id = kwargs["pre_fetched_msg"].id
+        await asyncio.sleep((104 - source_id) * 0.005)
+        if source_id == 100:
+            return "error"
+        sent = bot._deliver(USER_ID, source_id=source_id)
+        return {"status": "success", "sent_msg": sent, "sent_msg_id": sent.id, "sent_by": "bot"}
+    monkeypatch.setattr(main, "handle_download", download)
+    decision = main.new_pin_decision()
+    decision["pin_first"] = True
+    try:
+        await main.execute_batch_logic(bot, IncomingMessage("4"), "https://t.me/testchan/100", 4, decision)
+        assert pins() == [(USER_ID, 9101)]
+        assert bot_said("**processed** : `3`") and bot_said("**failed** : `1`")
     finally:
         await drain_tasks()
 

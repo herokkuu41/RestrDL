@@ -32,7 +32,12 @@
 
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
 uses four download and four upload connections across the entire bot, with at most two
-files active at once. Albums share these limits. Queued data, upload slices, and retry
+files active at once. Each download connection now permits two requests in flight and
+each upload connection four (8 download RPCs / 16 upload RPCs globally). Sending another
+part while awaiting earlier acknowledgements fills latency gaps; the old pipeline allowed
+only one request per connection. Large files enqueue completed chunks immediately rather
+than waiting for a slower earlier chunk. Small files retain ordered MD5 calculation.
+Albums share these limits. Queued data, upload slices, and retry
 payloads have a shared 64 MiB budget; this is a payload budget, not a cap on total process
 RAM. TgCrypto is required and checked at startup.
 
@@ -45,6 +50,8 @@ The existing server-side copy/forward path remains the first choice when availab
 |---|---:|---|
 | `PARALLEL_DOWNLOAD_WORKERS` | 4 | Global download connection slots |
 | `PARALLEL_UPLOAD_WORKERS` | 4 | Global upload connection slots |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 2 | Outstanding RPCs per download connection |
+| `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Outstanding RPCs per upload connection |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
 | `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
@@ -53,6 +60,9 @@ The existing server-side copy/forward path remains the first choice when availab
 Existing environment variables override defaults: update any old
 `PARALLEL_DOWNLOAD_WORKERS=3` value to `4` to use the new defaults. CDN streaming
 needs at least two download slots because it opens both an origin and a CDN session.
+With only one or two download connections, the manager admits one active file so CDN
+streaming cannot deadlock another producer holding the memory budget. With four download
+connections, native CDN reserves two and leaves the other two available for regular files.
 Native disk fallback is attempted only for unsupported file identifiers when space
 can be reserved. Oversized files are rejected before downloading using the destination
 bot's upload limit (normally 2000 MiB), even when the source user has Premium.
@@ -68,13 +78,54 @@ repository directory with your normal credentials configured:
 python -B scripts/benchmark_transfers.py --run --source https://t.me/channel/123 --target -1001234567890
 ```
 
-This sends up to **three real test posts** to your chosen destination: native download/
-upload, streaming with two connections per direction, and streaming with four. The native
+This sends up to **four real test posts** to your chosen destination: native download/
+upload, the previous four-connection relay, and pipelined streaming with two and four
+connections per direction. The native
 baseline is skipped when disk space is insufficient. JSON results include elapsed time,
 throughput, and streaming buffer peak. Repeat with representative files before changing
 the defaults; account limits, network conditions, and Telegram throttling can dominate
 performance. Automated tests establish correctness and overlapping transfers, not a
 guaranteed real-world speed increase.
+
+The updated benchmark sends up to **four** posts with the default arguments: native
+download/upload, the previous four-connection relay (one request per connection), then
+the new pipeline with two and four connections. Add `--connections 4 6` to compare four
+and six instead. Results include both decimal MB/s and binary MiB/s; run the same source
+and destination several times to assess improvement. Startup and final sends are included.
+
+### Server speed test and transfer diagnostics
+
+Send `/speedtest` in the bot chat while transfers are idle. It measures HTTP latency and
+four-connection download/upload bandwidth against [Cloudflare's test endpoints](https://github.com/cloudflare/speedtest).
+It uses at most 96 MiB traffic and streams 64 KiB blocks without a disk file. A global
+five-minute cooldown and one-test limit prevent repeated tests competing for bandwidth.
+`/killall` cancels it; the overall deadline is 75 seconds. This samples the route to
+Cloudflare, not Telegram, and is not an Ookla result.
+
+Your target **7.5 MB/s equals 60 Mbps**, or approximately 7.15 MiB/s. A sample above
+60 Mbps in each direction shows headroom to Cloudflare, but cannot establish Telegram
+throughput. Telegram can limit non-Premium source downloads; detected
+`FLOOD_PREMIUM_WAIT` now stops the batch with an explanation instead of silently waiting
+inside a worker. See [Telegram file transfer guidance](https://core.telegram.org/api/files)
+and [Premium download limits](https://telegram.org/faq_premium).
+
+`/logs` now includes transfer progress every 15 seconds, plus completion elapsed time,
+download rate, acknowledged upload rate, relay rate, source DC, request/connection limits,
+native CDN usage and the shared payload buffer peak. Direction rates are averages from
+relay start until that direction finishes, including startup and backpressure; they are
+not isolated download-only or upload-only benchmarks. Telegram progress edits occur at
+most every five seconds, and a slow edit no longer blocks other data workers.
+
+The first successful **source-order** post is pinned as soon as all earlier candidates
+finish or fail; a later quick text post cannot take the pin from earlier media. Private
+chat pins use the sender's own message ID namespace. Sent responses and album copies
+use the required `topics` field for Pyrofork 2.3.69, so completed sends are counted correctly.
+
+After deploying, restart with the new code and check the startup `Transfer settings`
+log. Existing environment values override defaults. Keep four connections, two download
+requests per connection and four upload requests per connection initially. A 64 MiB
+payload budget stays well within a 2 GB server without requiring full RAM/CPU utilization.
+Increase connection counts only when controlled measurements show a gain without waits.
 
 ### Run regression tests without modifying runtime files
 
@@ -186,6 +237,7 @@ If you prefer to run inside a Docker container:
 - **`/killall`** – Cancel any pending downloads if the bot hangs.  
 - **`/logs`** – Download the bot’s logs file.  
 - **`/stats`** – View current status (uptime, disk, memory, network, CPU, etc.).  
+- **`/speedtest`** – Measure server download/upload bandwidth and HTTP latency while idle.
 
 > **Note:** Make sure that your user session account is a member of the source chat or channel before downloading.
 

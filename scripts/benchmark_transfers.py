@@ -49,15 +49,18 @@ async def benchmark(args):
                 report("native", size, started, sent.id)
         else:
             print(json.dumps({"mode": "native", "skipped": "not enough disk space for baseline"}))
-        for connections in (2, 4):
-            manager = transfer.TransferManager(downloads=connections, uploads=connections)
+        modes = [("stream-4-before", 4, 1, 1)] + [
+            (f"pipeline-{connections}", connections, 2, 4) for connections in args.connections]
+        for mode, connections, download_requests, upload_requests in modes:
+            manager = transfer.TransferManager(downloads=connections, uploads=connections,
+                download_requests=download_requests, upload_requests=upload_requests)
             transfer._manager = manager
             transfer._manager_loop = asyncio.get_running_loop()
             try:
                 message = await source.get_messages(chat, identity)
                 started = time.monotonic()
                 sent = await transfer.relay_media(source, bot, message, target)
-                report(f"stream-{connections}", size, started, sent.id, manager.budget.peak)
+                report(mode, size, started, sent.id, manager.budget.peak)
             finally:
                 await manager.close()
 
@@ -66,12 +69,15 @@ def report(mode, size, started, message_id, buffer_peak=None):
     elapsed = time.monotonic() - started
     print(json.dumps({"mode": mode, "bytes": size, "seconds": round(elapsed, 3),
                       "MiB_per_second": round(size / 1048576 / elapsed, 3),
+                      "MB_per_second": round(size / 1e6 / elapsed, 3),
                       "sent_message_id": message_id, "buffer_peak_bytes": buffer_peak}))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", action="store_true", help="Actually upload three test posts to the destination")
+    parser.add_argument("--run", action="store_true", help="Actually upload test posts to the destination")
+    parser.add_argument("--connections", nargs="+", type=int, choices=range(2, 9), default=[2, 4],
+                        help="Connection counts to test for the new pipeline (default: 2 4)")
     parser.add_argument("--source", required=True, help="Representative Telegram post URL")
     parser.add_argument("--target", required=True, help="Destination chat ID or username")
     args = parser.parse_args()

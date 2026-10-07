@@ -126,68 +126,96 @@ class Credit:
 
 
 class ConnectionPool:
-    """Fixed global slots, including cached idle sessions across clients/DCs."""
-    def __init__(self, count):
+    """Fixed connections with bounded concurrent RPCs on each media session."""
+    def __init__(self, count, requests=1):
         self.available = asyncio.Queue()
+        self.capacity = count * requests
+        self.requests = requests
         self.sessions = [None] * count
         self.keys = [None] * count
+        self.users = [0] * count
+        self.invalid = [False] * count
+        self.conditions = [asyncio.Condition() for _ in range(count)]
+        self.authorizations = {}
         self.auth_lock = asyncio.Lock()
         self.native_lock = asyncio.Lock()
-        for index in range(count):
-            self.available.put_nowait(index)
+        for _ in range(requests):
+            for index in range(count):
+                self.available.put_nowait(index)
 
     @asynccontextmanager
     async def lease(self, client, dc):
         index = await self.available.get()
+        acquired = False
+        condition = self.conditions[index]
         try:
-            if self.keys[index] != (client, dc):
-                if self.sessions[index] is not None:
-                    await self.sessions[index].stop()
-                self.sessions[index] = None
-                self.keys[index] = None
-                worker = MTProtoWorkerSession(client, dc)
-                try:
-                    # Only foreign authorization must be serialized; same-DC
-                    # connections can initialize concurrently.
-                    if dc != await client.storage.dc_id():
-                        async with self.auth_lock:
+            async with condition:
+                # A DC switch or broken connection waits for all outstanding RPCs.
+                await condition.wait_for(lambda: self.users[index] == 0 or (
+                    self.keys[index] == (client, dc) and not self.invalid[index]))
+                if self.keys[index] != (client, dc) or self.invalid[index]:
+                    if self.sessions[index] is not None:
+                        await self.sessions[index].stop()
+                    self.sessions[index] = self.keys[index] = None
+                    worker = MTProtoWorkerSession(client, dc)
+                    worker.authorization_cache = self.authorizations
+                    try:
+                        if dc != await client.storage.dc_id():
+                            async with self.auth_lock:
+                                await startup_timeout(worker.start())
+                        else:
                             await startup_timeout(worker.start())
-                    else:
-                        await startup_timeout(worker.start())
-                except BaseException:
-                    await worker.stop()
-                    raise
-                self.sessions[index] = worker
-                self.keys[index] = (client, dc)
+                    except BaseException:
+                        await worker.stop()
+                        raise
+                    self.sessions[index] = worker
+                    self.keys[index] = (client, dc)
+                    self.invalid[index] = False
+                self.users[index] += 1
+                acquired = True
             yield self.sessions[index]
         except (OSError, TimeoutError, AuthKeyDuplicated, asyncio.CancelledError):
-            if self.sessions[index] is not None:
-                await self.sessions[index].stop()
-            self.sessions[index] = self.keys[index] = None
+            if acquired:
+                self.invalid[index] = True
             raise
         finally:
+            async with condition:
+                if acquired:
+                    self.users[index] -= 1
+                    if self.users[index] == 0 and self.invalid[index]:
+                        await self.sessions[index].stop()
+                        self.sessions[index] = self.keys[index] = None
+                condition.notify_all()
             self.available.put_nowait(index)
 
     async def close(self):
         await supervised([worker.stop() for worker in self.sessions if worker is not None])
         self.sessions[:] = [None] * len(self.sessions)
         self.keys[:] = [None] * len(self.keys)
+        self.authorizations.clear()
 
     @asynccontextmanager
     async def native(self):
-        # Pyrofork's CDN iterator opens both an origin and a CDN session.
-        # Reserve their slots atomically to avoid two iterators waiting on each other.
+        # Drain permits atomically, then reserve two whole connections for
+        # origin/CDN. Remaining connections must keep flowing: another file
+        # may have reserved the bytes this native producer is waiting for.
         if len(self.sessions) < 2:
             raise ValueError("CDN streaming requires at least two download connection slots")
         async with self.native_lock:
             indices = []
             try:
-                for _ in range(2):
+                for _ in range(self.capacity):
                     index = await self.available.get()
                     indices.append(index)
+                reserved = set(range(2))
+                for index in reserved:
                     if self.sessions[index] is not None:
                         await self.sessions[index].stop()
                     self.sessions[index] = self.keys[index] = None
+                returned = [index for index in indices if index not in reserved]
+                indices = [index for index in indices if index in reserved]
+                for index in returned:
+                    self.available.put_nowait(index)
                 yield
             finally:
                 for index in indices:
@@ -216,29 +244,43 @@ class TransferProgress:
         self.message = message
         self.started = time.monotonic()
         self.last_edit = self.started
+        self.last_log = self.started
         self.states = {}
         self.lock = asyncio.Lock()
 
     async def __call__(self, key, downloaded, uploaded, total):
         self.states[key] = (downloaded, uploaded, total)
+        now = time.monotonic()
+        down, up, size = map(sum, zip(*self.states.values()))
+        elapsed = max(now - self.started, 0.001)
+        if now - self.last_log >= 15:
+            self.last_log = now
+            LOGGER(__name__).info(
+                "Relay progress: downloaded=%s acknowledged=%s total=%s elapsed=%.1fs "
+                "download=%.2f MiB/s acknowledged-upload=%.2f MiB/s",
+                down, up, size, elapsed, down / elapsed / CHUNK_SIZE, up / elapsed / CHUNK_SIZE)
         if self.message is None:
             return
+        # A slow message edit must not hold all data workers behind its lock.
+        if self.lock.locked() or now - self.last_edit < 5:
+            return
         async with self.lock:
-            now = time.monotonic()
-            if now - self.last_edit < 5:
-                return
             self.last_edit = now
-            down, up, size = map(sum, zip(*self.states.values()))
-            elapsed = max(now - self.started, 0.001)
+            fraction = min(up / size, 1)
+            filled = int(fraction * 12)
+            bar = "▰" * filled + "▱" * (12 - filled)
             text = (
-                f"**Transferring**\n"
-                f"Downloaded: {down / 1048576:.1f}/{size / 1048576:.1f} MiB "
-                f"({down / elapsed / 1048576:.2f} MiB/s)\n"
-                f"Uploaded (confirmed): {up / 1048576:.1f}/{size / 1048576:.1f} MiB "
-                f"({up / elapsed / 1048576:.2f} MiB/s)\nElapsed: {elapsed:.0f}s"
+                f"⚡ **TRANSFER LIVE**\n{bar}  `{fraction:.0%}`\n\n"
+                f"📥 **Download**\n"
+                f"Downloaded: {down / CHUNK_SIZE:.1f}/{size / CHUNK_SIZE:.1f} MiB\n"
+                f"Average speed: `{down / elapsed / CHUNK_SIZE:.2f} MiB/s`\n\n"
+                f"📤 **Upload • acknowledged by Telegram**\n"
+                f"Uploaded (confirmed): {up / CHUNK_SIZE:.1f}/{size / CHUNK_SIZE:.1f} MiB\n"
+                f"Average speed: `{up / elapsed / CHUNK_SIZE:.2f} MiB/s`\n\n"
+                f"⏱ **Elapsed** `{elapsed:.0f}s`  •  🧠 **Streaming in memory**"
             )
             try:
-                await self.message.edit(text)
+                await self.message.edit(text, parse_mode=ParseMode.MARKDOWN)
             except (FloodWait, AuthKeyDuplicated, pyrogram.StopTransmission):
                 raise
             except Exception as error:
@@ -246,10 +288,18 @@ class TransferProgress:
 
 
 class TransferManager:
-    def __init__(self, downloads=None, uploads=None, active=None, buffer_mib=None):
-        self.downloads = ConnectionPool(downloads or PyroConf.PARALLEL_DOWNLOAD_WORKERS)
-        self.uploads = ConnectionPool(uploads or PyroConf.PARALLEL_UPLOAD_WORKERS)
-        self.active = asyncio.Semaphore(active or PyroConf.MAX_ACTIVE_TRANSFERS)
+    def __init__(self, downloads=None, uploads=None, active=None, buffer_mib=None,
+                 download_requests=None, upload_requests=None):
+        self.downloads = ConnectionPool(downloads or PyroConf.PARALLEL_DOWNLOAD_WORKERS,
+            download_requests or PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION)
+        self.uploads = ConnectionPool(uploads or PyroConf.PARALLEL_UPLOAD_WORKERS,
+            upload_requests or PyroConf.UPLOAD_REQUESTS_PER_CONNECTION)
+        self.active_limit = active or PyroConf.MAX_ACTIVE_TRANSFERS
+        if len(self.downloads.sessions) <= 2:
+            # Native CDN uses both slots. Another producer holding memory and
+            # waiting for those slots would prevent the CDN producer advancing.
+            self.active_limit = 1
+        self.active = asyncio.Semaphore(self.active_limit)
         self.budget = ByteBudget((buffer_mib or PyroConf.TRANSFER_BUFFER_MIB) * 1048576)
         self.disk_lock = asyncio.Lock()
         self.disk_reserved = 0
@@ -269,7 +319,7 @@ class TransferManager:
             async with self.downloads.lease(source, fid.dc_id) as worker:
                 response = await worker.session.invoke(raw.functions.upload.GetFile(
                     location=get_file_location(fid), offset=offset, limit=CHUNK_SIZE
-                ), sleep_threshold=30)
+                ), sleep_threshold=0, retries=0)
             if isinstance(response, raw.types.upload.FileCdnRedirect):
                 raise CdnRedirect()
             if not isinstance(response, raw.types.upload.File) or len(response.bytes) != expected:
@@ -286,7 +336,7 @@ class TransferManager:
         ))
         async def operation():
             async with self.uploads.lease(bot, dc) as worker:
-                result = await worker.session.invoke(query, sleep_threshold=30)
+                result = await worker.session.invoke(query, sleep_threshold=0, retries=0)
             if result is not True:
                 raise OSError(f"Telegram did not acknowledge upload part {part}")
         await retry(operation)
@@ -324,7 +374,9 @@ class TransferManager:
                         raise ValueError("Source media changed during transfer")
 
     async def pipe(self, source, bot, message, fid, size, name, progress, native=False):
-        queue = asyncio.Queue(16)
+        started = time.monotonic()
+        down_finished = up_finished = None
+        queue = asyncio.Queue(self.uploads.capacity * 2)
         credits = set()
         pending = []
         file_id = bot.rnd_id()
@@ -338,13 +390,15 @@ class TransferManager:
                 await progress(key, downloaded, uploaded, size)
 
         async def chunk(offset):
-            nonlocal downloaded
+            nonlocal downloaded, down_finished
             expected = min(CHUNK_SIZE, size - offset)
             await self.budget.acquire(2 * expected)
             credit = Credit(self.budget, 2 * expected, math.ceil(expected / PART_SIZE))
             credits.add(credit)
             data = await self.fetch(source, fid, offset, expected)
             downloaded += len(data)
+            if downloaded == size:
+                down_finished = time.monotonic()
             await notify()
             return offset, data, credit
 
@@ -355,7 +409,7 @@ class TransferManager:
                 await queue.put(((offset + start) // PART_SIZE, data[start:start + PART_SIZE], credit))
 
         async def produce():
-            nonlocal downloaded
+            nonlocal downloaded, down_finished
             if native:
                 offset = 0
                 # Reserve before requesting bytes; native GetFile validates CDN hashes.
@@ -373,9 +427,12 @@ class TransferManager:
                         if len(data) != expected:
                             raise ValueError("Native download returned a truncated/oversized chunk")
                         downloaded += len(data)
+                        if downloaded == size:
+                            down_finished = time.monotonic()
                         await notify()
                         await enqueue(offset, data, credit)
                         offset += len(data)
+                        data = None
                     # Do not retain the final data buffer while waiting for acknowledgements.
                     data = None
                 finally:
@@ -383,12 +440,19 @@ class TransferManager:
             else:
                 offsets = iter(range(0, size, CHUNK_SIZE))
                 try:
-                    for _ in range(len(self.downloads.sessions)):
+                    for _ in range(self.downloads.capacity):
                         offset = next(offsets, None)
                         if offset is not None:
                             pending.append(asyncio.create_task(chunk(offset)))
                     while pending:
-                        task = pending.pop(0)
+                        if size <= 10 * CHUNK_SIZE:
+                            task = pending[0]  # MD5 requires source order.
+                        else:
+                            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                            # Observe failed RPCs before accepting other completed chunks.
+                            task = next((t for t in done if t.cancelled() or t.exception()), next(iter(done)))
+                            done = None  # Don't retain acknowledged chunk payloads.
+                        pending.remove(task)
                         try:
                             offset, data, credit = await task
                         finally:
@@ -405,11 +469,11 @@ class TransferManager:
                     for task in pending:
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
-            for _ in self.uploads.sessions:
+            for _ in range(self.uploads.capacity):
                 await queue.put(None)
 
         async def consume():
-            nonlocal uploaded
+            nonlocal uploaded, up_finished
             while True:
                 item = await queue.get()
                 if item is None:
@@ -417,6 +481,8 @@ class TransferManager:
                 part, data, credit = item
                 await self.put_part(bot, file_id, part, count, size, data)
                 uploaded += len(data)
+                if uploaded == size:
+                    up_finished = time.monotonic()
                 await credit.acknowledged()
                 if not credit.amount:
                     credits.discard(credit)
@@ -426,12 +492,22 @@ class TransferManager:
         try:
             if native:
                 async with self.downloads.native():
-                    await supervised([produce(), *(consume() for _ in self.uploads.sessions)])
+                    await supervised([produce(), *(consume() for _ in range(self.uploads.capacity))])
             else:
-                await supervised([produce(), *(consume() for _ in self.uploads.sessions)])
+                await supervised([produce(), *(consume() for _ in range(self.uploads.capacity))])
             if downloaded != size or uploaded != size:
                 raise ValueError("Transfer completed with missing bytes")
-            LOGGER(__name__).info("Relay complete: %s bytes, buffer peak %s bytes", size, self.budget.peak)
+            elapsed = max(time.monotonic() - started, 0.001)
+            down_seconds = max(down_finished - started, 0.001)
+            up_seconds = max(up_finished - started, 0.001)
+            LOGGER(__name__).info(
+                "Relay complete: %s bytes, %.3fs, relay=%.2f MiB/s, download=%.2f MiB/s, "
+                "acknowledged-upload=%.2f MiB/s, DC=%s, connections=%s/%s, requests=%s/%s, "
+                "native=%s, buffer peak %s bytes",
+                size, elapsed, size / elapsed / CHUNK_SIZE, size / down_seconds / CHUNK_SIZE,
+                size / up_seconds / CHUNK_SIZE, getattr(fid, "dc_id", None),
+                len(self.downloads.sessions), len(self.uploads.sessions), self.downloads.capacity,
+                self.uploads.capacity, native, self.budget.peak)
             if size > 10 * 1048576:
                 return raw.types.InputFileBig(id=file_id, parts=count, name=name)
             return raw.types.InputFile(id=file_id, parts=count, name=name, md5_checksum=digest.hexdigest())
@@ -622,9 +698,26 @@ async def sent_messages(bot, response):
     ))]
     if not messages:
         raise RuntimeError("Telegram did not return a sent message")
+    messages.sort(key=lambda message: message.id)
     return await utils.parse_messages(bot, raw.types.messages.Messages(
-        messages=messages, users=response.users, chats=response.chats
+        messages=messages, topics=getattr(response, "topics", None) or [],
+        users=response.users, chats=response.chats
     ))
+
+
+async def copy_album(client, chat_id, source_chat, message_id):
+    """Native file-ID copy, avoiding Pyrofork 2.3.69's topics parsing regression."""
+    messages = sorted(await client.get_media_group(source_chat, message_id), key=lambda m: m.id)
+    items = []
+    for message in messages:
+        encoded = extract_media_info(message)[2]
+        items.append(raw.types.InputSingleMedia(
+            media=utils.get_input_media_from_file_id(
+                encoded, has_spoiler=getattr(message, "has_media_spoiler", False)),
+            random_id=client.rnd_id(), **await caption(client, message)))
+    query = raw.functions.messages.SendMultiMedia(
+        peer=await client.resolve_peer(chat_id), multi_media=items)
+    return await sent_messages(client, await retry(lambda: client.invoke(query)))
 
 
 async def finalize(bot, query, uploads, manager):

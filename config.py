@@ -45,14 +45,19 @@ class PyroConf(object):
     PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
     PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "4"))
+    DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "2"))
+    UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
     TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
 
     for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
+                  "DOWNLOAD_REQUESTS_PER_CONNECTION", "UPLOAD_REQUESTS_PER_CONNECTION",
                   "MAX_ACTIVE_TRANSFERS", "TRANSFER_BUFFER_MIB", "DISK_RESERVE_MIB"):
         if locals()[_name] <= 0:
             raise ValueError(f"{_name} must be positive")
+    if max(DOWNLOAD_REQUESTS_PER_CONNECTION, UPLOAD_REQUESTS_PER_CONNECTION) > 8:
+        raise ValueError("Requests per connection must not exceed 8")
     if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
         raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 

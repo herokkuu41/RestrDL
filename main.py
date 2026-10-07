@@ -7,7 +7,7 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, FloodWait, AuthKeyDuplicated
+from pyrogram.errors import PeerIdInvalid, FloodWait, FloodPremiumWait, AuthKeyDuplicated
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -25,7 +25,8 @@ from helpers.msg import (
     getChatMsgID,
     get_parsed_msg
 )
-from helpers.transfer import relay_media, close_transfers
+from helpers.transfer import relay_media, close_transfers, copy_album
+from helpers.speedtest import run_speedtest, format_speedtest
 
 from config import PyroConf
 from logger import LOGGER
@@ -153,12 +154,8 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
     # 2. Primary target with both_sides=False (Telegram allows single-side pin in bot chats)
     if is_private:
         attempts.append((primary_client, primary_chat_id, False))
-        # 3. Fallback to alternate client in private chat (user <-> bot fallback)
-        alt_client = user if primary_client == decision.get("bot") else decision.get("bot")
-        alt_chat = decision.get("user_chat_id") if alt_client == user else decision.get("chat_id")
-        if alt_client and alt_chat:
-            attempts.append((alt_client, alt_chat, True))
-            attempts.append((alt_client, alt_chat, False))
+        # Private IDs belong to the sender's message box. Reusing the number
+        # with another client can pin an unrelated message with the same ID.
     else:
         # Channel/group fallback: if bot failed, try user session if available
         if primary_client == decision.get("bot") and user:
@@ -434,8 +431,7 @@ async def try_clone(bot: Client, chat_message, chat_id, message_id,
                 sent = await client.forward_messages(
                     chat_id=dest, from_chat_id=chat_id, message_ids=ids, drop_author=True)
             elif is_group:
-                sent = await client.copy_media_group(
-                    chat_id=dest, from_chat_id=chat_id, message_id=message_id)
+                sent = await copy_album(client, dest, chat_id, message_id)
             else:
                 sent = await client.copy_message(
                     chat_id=dest, from_chat_id=chat_id, message_id=message_id)
@@ -518,9 +514,10 @@ async def start(_, message: Message):
         "I can grab photos, videos, audio, and documents from any Telegram post.\n"
         "Just send me a link (paste it directly or use `/dl <link>`),\n"
         "or reply to a message with `/dl`.\n\n"
-        "**New Feature:**\n"
+        "⚡ **TRANSFER TOOLS**\n"
         "Use `/batch` to clone/download multiple messages easily!\n"
         "Use `/set <channel_id>` to set a custom upload destination.\n"
+        "Use `/speedtest` to measure this server's download, upload and latency.\n"
         "Batch mode first asks whether to **pin the first post** — tap a button or reply `yes` / `no`.\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
         "🔒 Make sure the user client is part of the chat.\n\n"
@@ -556,6 +553,7 @@ async def help_command(_, message: Message):
         "   – `/killall` : Cancel all running tasks.\n"
         "   – `/logs` : Get log file.\n"
         "   – `/stats` : System status.\n\n"
+        "   – `/speedtest` : Server network download/upload test (run when idle).\n\n"
         "➤ **Notes**\n"
         "   – With no destination set, **everything** (text, photos, videos, files) is\n"
         "     delivered to **this bot chat** — never to Saved Messages.\n"
@@ -690,7 +688,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
             elif chat_message.media:
                 if not silent:
-                    progress_message = await message.reply("**Starting streaming transfer...**")
+                    progress_message = await message.reply("⚡ **PREPARING TRANSFER**\n\n📥 Download + 📤 upload\n🧠 Bounded memory stream • no full-file disk buffer")
 
                 sent_msg = await relay_media(user, bot, chat_message, target_chat_id,
                                              progress_message=progress_message, abort_event=abort_event)
@@ -730,6 +728,18 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 except Exception:
                     pass
             raise
+
+        except FloodPremiumWait as e:
+            LOGGER(__name__).warning("Telegram account download throttle: FLOOD_PREMIUM_WAIT_%s", e.value)
+            if abort_event:
+                abort_event.set()
+            await reply_temporary(message,
+                f"⏳ **Telegram download limit**\n\nTelegram requires `{e.value}s` before another request.\n"
+                "The source account's non-Premium download limit is active. More RAM or upload workers "
+                "cannot remove this limit. The batch has stopped; wait before trying again.")
+            if progress_message:
+                await progress_message.delete()
+            return "aborted"
 
         except FloodWait as e:
             if abort_event and not abort_event.is_set():
@@ -838,7 +848,7 @@ async def batch_command_start(bot: Client, message: Message):
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set", "speedtest"]))
 async def handle_text_and_states(bot: Client, message: Message):
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
@@ -962,9 +972,10 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     thread_text = f"\n**Topic/Thread Filter Active**: ID `{start_thread_id}`" if start_thread_id else ""
     loading = await message.reply(
         f"📥 **Starting Batch Process**\n"
-        f"From: `{start_id}`\n"
-        f"To: `{end_id}`\n"
-        f"Total Range Checked: `{count}` posts{thread_text}"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 **From:** `{start_id}`  →  **To:** `{end_id}`\n"
+        f"🗂 **Total Range Checked:** `{count}` posts{thread_text}\n"
+        f"⚡ Parallel download + upload • 📌 pin follows source order"
     )
 
     downloaded = skipped = failed = 0
@@ -984,17 +995,27 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     pin_decision["private"] = pin_decision["user_chat_id"] != pin_decision["chat_id"]
     pin_decision["batch_started"] = True
 
-    async def record_and_pin_first(res):
-        """Immediately record the first uploaded post and pin it right away without waiting for the batch chunk to finish."""
-        if isinstance(res, dict) and res.get("status") == "success" and res.get("sent_msg_id"):
-            if not pin_decision.get("first_msg_id"):
+    ordered_results = {}  # Insertion order follows the original source posts.
+
+    async def record_and_pin_first(source_id, res):
+        """Later fast text posts cannot steal the pin from earlier media."""
+        if pin_decision.get("first_msg_id") or abort_event.is_set():
+            return
+        ordered_results[source_id] = res
+        for candidate in ordered_results.values():
+            if candidate is None:
+                return  # An earlier source post is still transferring.
+            if isinstance(candidate, dict) and candidate.get("status") == "success" and candidate.get("sent_msg_id"):
+                res = candidate
                 pin_decision["first_msg_id"] = res["sent_msg_id"]
                 pin_decision["first_msg"] = res.get("sent_msg")
                 pin_decision["first_sender"] = res.get("sent_by") or "bot"
+                ordered_results.clear()
                 if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
                         and not pin_decision.get("pin_failed"):
                     await pin_first_post(pin_decision, notify=message.reply,
                                          error_notify=lambda text: reply_temporary(message, text))
+                return
 
     async def consume_results(results):
         """Tally a finished chunk and pin the first uploaded post exactly once."""
@@ -1008,10 +1029,6 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 continue
             if status == "success":
                 downloaded += 1
-                if isinstance(result, dict) and result.get("sent_msg_id") and not pin_decision.get("first_msg_id"):
-                    pin_decision["first_msg_id"] = result["sent_msg_id"]
-                    pin_decision["first_msg"] = result.get("sent_msg")
-                    pin_decision["first_sender"] = result.get("sent_by") or "bot"
             else:
                 failed += 1
 
@@ -1067,7 +1084,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         if getattr(messages_batch, "id", None) is not None:
              messages_batch = [messages_batch]
 
-        for chat_msg in messages_batch:
+        for chat_msg in sorted(messages_batch, key=lambda m: getattr(m, "id", 0)):
             if abort_event.is_set():
                 break
 
@@ -1093,13 +1110,19 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 skipped += 1
                 continue
 
-            async def run_and_track_task(coro):
-                res = await coro
-                await record_and_pin_first(res)
+            async def run_and_track_task(source_id, coro):
+                try:
+                    res = await coro
+                except BaseException as error:
+                    await record_and_pin_first(source_id, error)
+                    raise
+                await record_and_pin_first(source_id, res)
                 return res
 
             url = f"{prefix}/{chat_msg.id}"
-            task = track_task(run_and_track_task(handle_download(
+            if not pin_decision.get("first_msg_id"):
+                ordered_results[chat_msg.id] = None
+            task = track_task(run_and_track_task(chat_msg.id, handle_download(
                 bot, message, url, 
                 silent=False, 
                 pre_fetched_msg=chat_msg, 
@@ -1185,6 +1208,42 @@ async def logs(_, message: Message):
         await message.reply("**Not exists**")
 
 
+SPEEDTEST_RUNNING = False
+SPEEDTEST_LAST_RUN = 0.0
+
+
+@bot.on_message(filters.command("speedtest") & filters.private)
+async def speedtest_command(_, message: Message):
+    global SPEEDTEST_RUNNING, SPEEDTEST_LAST_RUN
+    if SPEEDTEST_RUNNING:
+        return await message.reply("⏳ **Speed test already running.** Please wait for its result.")
+    if ACTIVE_BATCHES or any(not task.done() for task in RUNNING_TASKS):
+        return await message.reply("⏳ **Transfers are active.** Run `/speedtest` after they finish for a useful result.")
+    remaining = 300 - (time() - SPEEDTEST_LAST_RUN)
+    if remaining > 0:
+        return await message.reply(f"⏳ **Speed test cooldown:** `{remaining:.0f}s` remaining.")
+    SPEEDTEST_RUNNING = True
+    SPEEDTEST_LAST_RUN = time()
+    status = None
+    try:
+        status = await message.reply(
+            "🌐 **SERVER SPEED TEST**\n\n📡 Measuring latency, download and upload…\n"
+            "Cloudflare endpoint • up to 96 MiB traffic • no disk buffer\n"
+            "⏱ Usually under a minute. Cancel with `/killall`.")
+        result = await track_task(run_speedtest())
+        await status.edit(format_speedtest(result))
+        LOGGER(__name__).info("Server speed test: %s", result)
+    except asyncio.CancelledError:
+        if status:
+            await status.edit("🛑 **Server speed test cancelled.**")
+    except Exception as error:
+        LOGGER(__name__).warning("Server speed test failed: %s", error)
+        if status:
+            await status.edit("⚠️ **Speed test failed.** The test endpoint may be unavailable; see `/logs`.")
+    finally:
+        SPEEDTEST_RUNNING = False
+
+
 @bot.on_callback_query(filters.regex(r"^pin_decision:(yes|no):(\d+)$"))
 async def pin_decision_callback(_, query):
     parts = (query.data or "").split(":")
@@ -1242,6 +1301,11 @@ async def initialize():
         raise RuntimeError("TgCrypto is required for fast transfers; install requirements.txt")
     global download_semaphore
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
+    LOGGER(__name__).info(
+        "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, payload-buffer=%s MiB",
+        PyroConf.PARALLEL_DOWNLOAD_WORKERS, PyroConf.PARALLEL_UPLOAD_WORKERS,
+        PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION, PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
+        PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB)
 
 
 # -------------------------------------------------------------------------------------

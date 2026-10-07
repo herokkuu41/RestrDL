@@ -123,9 +123,14 @@ class MTProtoWorkerSession:
 
         test_mode = await storage.test_mode()
         main_dc = await storage.dc_id()
+        cache = getattr(self, "authorization_cache", None)
+        cache_key = (id(self.client), self.dc_id, test_mode)
+        cached = cache.get(cache_key) if cache is not None else None
 
         if self.dc_id == main_dc:
             auth_key = await storage.auth_key()
+        elif cached is not None:
+            auth_key = cached
         else:
             auth_key = await Auth(self.client, self.dc_id, test_mode).create()
 
@@ -138,7 +143,7 @@ class MTProtoWorkerSession:
         )
         await self.session.start()
 
-        if self.dc_id != main_dc:
+        if self.dc_id != main_dc and cached is None:
             for _ in range(3):
                 exported_auth = await self.client.invoke(
                     raw.functions.auth.ExportAuthorization(dc_id=self.dc_id)
@@ -157,6 +162,8 @@ class MTProtoWorkerSession:
             else:
                 await self.session.stop()
                 raise AuthBytesInvalid("Failed to import authorization after 3 attempts")
+            if cache is not None:
+                cache[cache_key] = auth_key
 
     async def fetch_chunk(self, location: Any, offset_bytes: int, limit: int) -> bytes:
         if not self.session:
