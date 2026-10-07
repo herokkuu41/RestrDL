@@ -46,7 +46,8 @@ async def run(args):
     start = monotonic()
     try:
         result = await render_board_video(source, events, os.path.join(args.output, "board-face.mp4"),
-                                         clip_start=args.start, clip_duration=args.seconds)
+                                         clip_start=args.start, clip_duration=args.seconds,
+                                         layout=args.layout)
     finally:
         monitor.cancel()
         try:
@@ -66,4 +67,5 @@ if __name__ == "__main__":
     parser.add_argument("--camera", help="Use an already verified local camera track for repeat rendering tests")
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--seconds", type=float, default=30)
+    parser.add_argument("--layout", choices=("side_by_side", "pip"), default="side_by_side")
     asyncio.run(run(parser.parse_args()))

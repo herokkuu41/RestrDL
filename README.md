@@ -245,6 +245,44 @@ If you prefer to run inside a Docker container:
 - **`/batch_watch <Telegram start link> <count>`** (also `/batch_watch_board`) –
   Export lessons linked through **Watch Board & Face**. Send the command without
   arguments for the guided link/count prompts. This is separate from `/batch`.
+- **`/batch_watch_video <Telegram start link> <count>`** (also `/batch_watch_pip`) –
+  New **board-first** export: original board with a small teacher at bottom-left.
+  Supports the guided link/count prompts too; `/batch_watch` is unchanged.
+
+### Faster board-first video mode (new command)
+
+`/batch_watch_video` has its own batch loop and authenticates the supported
+player with the password from each source caption or media filename. It downloads
+the teacher from the URL (never Telegram's low-quality attachment), retrieves the
+original slides/timed handwriting, and exports one full-length MP4. The board
+uses native slide detail within the configured ceilings. The teacher is reduced
+to at most one quarter of the board width, in a bottom-left footer **outside**
+the board, so notes are never obscured. Captions/entities, source-title filenames,
+destination settings, counts, `/killall`, disk reserve, upload limits, and confirmed
+sends are supported. Wrong passwords, missing assets, and encoder failures do
+not send a camera-only replacement. FloodWait stops the batch without retry loops.
+
+Only this new layout caps output/teacher motion at **12 fps** by default; timed
+handwriting still updates at `WATCH_BOARD_FPS` (8 by default). Set
+`WATCH_BOARD_PIP_FPS=24` or `30` for smoother teacher motion at increased encoding
+cost (never above the source frame rate). Audio, full duration, and board spatial
+detail are retained. The new mode matches the web player's displayed ink: its
+published compiler ignores selected-object deletion (`dlos`) events, leaving
+those annotations visible. This compatibility behavior is isolated to the new
+mode. The existing `/batch_watch` keeps its own deletion handling, side-by-side layout
+and source teacher frame rate. Both layouts share the one-encoder global lock,
+bounded slide cache, and frame pipe; no Chromium or full-file RAM buffer is used.
+
+The browser exposed **one 640×360 teacher video plus a canvas**, not two video
+files or a separate premium-quality download. Combining the board into a standard
+Telegram video therefore still requires encoding; it cannot be an instant
+download of a pre-existing combined HD file. No guessed CDN variants or fake
+upscaling are used. On this desktop, the same real-source 120-second sample took
+**6.70s / 196.4 MiB peak / 4.11 MiB output** in the new 760×552 / 12-fps layout,
+versus **18.16s / 262.2 MiB / 14.51 MiB** in the existing 1400×428 layout. These
+are local diagnostic measurements, not a guarantee for the 1.5-core server or
+Telegram network throughput. Use the probe below with `--layout pip` to compare
+on the deployment host. It does not open a Telegram session.
 
 ### Watch Board & Face quality
 

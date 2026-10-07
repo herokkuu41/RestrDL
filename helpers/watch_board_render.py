@@ -295,6 +295,20 @@ class BoardTimeline:
         return self.frame
 
 
+class PlayerBoardTimeline(BoardTimeline):
+    """Match the supported web player's visible ink, only for the new layout.
+
+    Its published UAObEngine.compileTimeline does not compile `dlos` (selected
+    object deletion) events. Consequently those annotations remain visible in
+    the browser. Keep that behavior here instead of silently dropping notes
+    present in the requested player view. Legacy /batch_watch is unaffected.
+    """
+
+    def _ink(self, data):
+        if (data.get("data", data) or {}).get("e") != "dlos":
+            super()._ink(data)
+
+
 class SlideCache:
     def __init__(self, session, encoded_cache=None):
         self.session, self.cache = session, OrderedDict()
@@ -424,12 +438,16 @@ def format_render_progress(current, total, elapsed):
 
 
 async def render_board_video(camera_path, events, dest_path, abort_event=None, progress=None,
-                             max_size=2000 * 1048576, *, clip_start=0, clip_duration=None):
+                             max_size=2000 * 1048576, *, clip_start=0, clip_duration=None,
+                             layout="side_by_side"):
     """Stream a bounded number of raw board frames to FFmpeg; retain no frame files.
 
     clip_* are for opt-in diagnostics only. Batch callers always render full length.
-    The teacher column is separate so it never covers any board text.
+    Both layouts keep the teacher outside the board so it never covers text.
+    The default path is unchanged; only the new command requests the PiP footer.
     """
+    if layout not in ("side_by_side", "pip"):
+        raise ValueError("Unsupported Watch Board layout")
     async with _render_lock:
         started = monotonic()
         if abort_event and abort_event.is_set():
@@ -442,7 +460,8 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         if duration <= 0 or clip_start < 0:
             raise ValueError("Invalid render duration")
         # Check the whole requested timeline before starting an expensive encode.
-        await asyncio.to_thread(BoardTimeline(events).advance, clip_start + duration)
+        timeline_class = PlayerBoardTimeline if layout == "pip" else BoardTimeline
+        await asyncio.to_thread(timeline_class(events).advance, clip_start + duration)
         board_w, height = PyroConf.WATCH_BOARD_WIDTH, PyroConf.WATCH_BOARD_HEIGHT
         encoded_slides = OrderedDict()
         if PyroConf.WATCH_BOARD_NATIVE_SIZE:
@@ -466,6 +485,19 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         graph = (f"[0:v]fps={camera_fps},pad={board_w+teacher_w}:{height}:0:0:black[b];"
                  f"[1:v]scale={teacher_w}:{height}:force_original_aspect_ratio=decrease[c];"
                  f"[b][c]overlay=x={board_w}:y=(H-h)/2:shortest=1[v]")
+        output_w, output_h = board_w + teacher_w, height
+        if layout == "pip":
+            # Main board remains pixel-for-pixel at the chosen resolution.
+            # A reserved footer avoids obscuring notes with the small camera.
+            teacher_w = min(int(meta["size"][0]), max(2, board_w // 4))
+            teacher_w -= teacher_w % 2
+            teacher_h = max(2, round(teacher_w * meta["size"][1] / meta["size"][0]))
+            teacher_h += teacher_h % 2
+            camera_fps = min(camera_fps, PyroConf.WATCH_BOARD_PIP_FPS)
+            output_w, output_h = board_w, height + teacher_h + 16
+            graph = (f"[0:v]fps={camera_fps},pad={output_w}:{output_h}:0:0:black[b];"
+                     f"[1:v]fps={camera_fps},scale={teacher_w}:{teacher_h}[c];"
+                     f"[b][c]overlay=x=8:y={height+8}:shortest=1[v]")
         temp_path = dest_path + ".rendering.mp4"
         args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
                 "-filter_complex_threads", "1", "-threads", "1", "-thread_queue_size", "2",
@@ -492,7 +524,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
 
         error_task = asyncio.create_task(read_errors())
         reserve = PyroConf.DISK_RESERVE_MIB * 1048576
-        timeline = BoardTimeline(events, (board_w, height))
+        timeline = timeline_class(events, (board_w, height))
         last_progress = -math.inf
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -532,7 +564,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
             elapsed = monotonic() - started
             LOGGER(__name__).info("Watch Board export: %sx%s, %.2fs, %s bytes, %s slide selections; "
                                   "%.2fs elapsed, %.2fx realtime, preset=%s",
-                                  board_w + teacher_w, height, duration, os.path.getsize(dest_path),
+                                  output_w, output_h, duration, os.path.getsize(dest_path),
                                   sum((e.get("data") or {}).get("e") == "sc" for e in events),
                                   elapsed, duration / max(elapsed, 0.001), PyroConf.WATCH_BOARD_PRESET)
             return dest_path

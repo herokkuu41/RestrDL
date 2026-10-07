@@ -43,6 +43,7 @@ from helpers.msg import (
 )
 from helpers.transfer import relay_media, close_transfers, copy_album
 from helpers.speedtest import run_speedtest, format_speedtest, format_speedtest_error
+from helpers.watch_board_pip import run_pip_batch
 
 from config import PyroConf
 from logger import LOGGER
@@ -565,6 +566,10 @@ async def help_command(_, message: Message):
         "   2. Send the **Start Link** of the first post\n"
         "   3. Send the **Number of Messages**\n"
         "   The bot downloads Watch Board videos directly and sends them.\n\n"
+        "➤ **Board-first Video (New)**\n"
+        "   – `/batch_watch_video` (or `/batch_watch_pip`), then link and count.\n"
+        "   – Full board + small teacher at bottom-left; encoding required.\n"
+        "   – This is separate from the unchanged `/batch_watch` mode.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
         "   – `/set none`: Reset to default (upload to the bot chat).\n"
@@ -897,7 +902,46 @@ async def batch_watch_command_start(bot: Client, message: Message):
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "batch_watch", "batch_watch_board", "stats", "logs", "killall", "set", "speedtest"]))
+@bot.on_message(filters.command(["batch_watch_video", "batch_watch_pip"]) & filters.private)
+async def batch_watch_video_command_start(bot: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in ACTIVE_BATCHES:
+        return await reply_temporary(message, "⏳ A batch is already running. Wait or use /killall first.")
+    await release_pending_prompt(user_id, "⌛ Starting a board-first batch; the old pin prompt is closed.")
+    if (len(message.command) >= 3 and message.command[2].isdigit()
+            and message.command[1].startswith("https://t.me/")):
+        count = int(message.command[2])
+        if count <= 0:
+            return await reply_temporary(message, "❌ Please send a valid positive number.")
+        BATCH_STATES.pop(user_id, None)
+        track_task(process_watch_video_batch(bot, message, message.command[1], count))
+        return
+    BATCH_STATES[user_id] = {'step': 'ask_link', 'mode': 'watch_pip'}
+    await message.reply("🎞 **Board-first Video Mode**\n\n"
+                        "Send the Telegram post link containing Watch Board & Face.\n"
+                        "Original board with a small teacher at bottom-left; encoding is required.")
+
+
+async def process_watch_video_batch(bot, message, start_link, count, abort_event=None):
+    user_id = message.from_user.id
+    if user_id in ACTIVE_BATCHES:
+        return await reply_temporary(message, "⏳ A batch is already running. Wait or use /killall first.")
+    abort_event = abort_event or asyncio.Event()
+    state = {"abort": abort_event, "cancelled": False}
+    ACTIVE_BATCHES[user_id] = state
+    try:
+        target = await resolve_target_chat_id(bot, message)
+        await run_pip_batch(bot, user, message, start_link, count, target_chat_id=target,
+                            abort_event=abort_event, notify=reply_temporary)
+    except asyncio.CancelledError:
+        state["cancelled"] = True
+        raise
+    finally:
+        if ACTIVE_BATCHES.get(user_id) is state:
+            ACTIVE_BATCHES.pop(user_id, None)
+
+
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "batch_watch", "batch_watch_board", "batch_watch_video", "batch_watch_pip", "stats", "logs", "killall", "set", "speedtest"]))
 async def handle_text_and_states(bot: Client, message: Message):
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
@@ -927,6 +971,10 @@ async def handle_text_and_states(bot: Client, message: Message):
             mode = BATCH_STATES[user_id].get('mode', 'normal')
 
             del BATCH_STATES[user_id]
+
+            if mode == 'watch_pip':
+                track_task(process_watch_video_batch(bot, message, start_link, count))
+                return
 
             if mode == 'watch_board':
                 track_task(process_watch_board_batch(bot, message, start_link, count))
