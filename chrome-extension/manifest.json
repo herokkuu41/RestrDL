@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Inspect Capture for AI Debugging",
+  "version": "1.0.0",
+  "description": "Captures a bounded DevTools network HAR and page diagnostics into a local JSON file.",
+  "devtools_page": "devtools.html",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["downloads"]
+}

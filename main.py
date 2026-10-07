@@ -26,7 +26,7 @@ from helpers.msg import (
     get_parsed_msg
 )
 from helpers.transfer import relay_media, close_transfers, copy_album
-from helpers.speedtest import run_speedtest, format_speedtest
+from helpers.speedtest import run_speedtest, format_speedtest, format_speedtest_error
 
 from config import PyroConf
 from logger import LOGGER
@@ -1223,7 +1223,6 @@ async def speedtest_command(_, message: Message):
     if remaining > 0:
         return await message.reply(f"⏳ **Speed test cooldown:** `{remaining:.0f}s` remaining.")
     SPEEDTEST_RUNNING = True
-    SPEEDTEST_LAST_RUN = time()
     status = None
     try:
         status = await message.reply(
@@ -1233,13 +1232,14 @@ async def speedtest_command(_, message: Message):
         result = await track_task(run_speedtest())
         await status.edit(format_speedtest(result))
         LOGGER(__name__).info("Server speed test: %s", result)
+        SPEEDTEST_LAST_RUN = time()
     except asyncio.CancelledError:
         if status:
             await status.edit("🛑 **Server speed test cancelled.**")
     except Exception as error:
         LOGGER(__name__).warning("Server speed test failed: %s", error)
         if status:
-            await status.edit("⚠️ **Speed test failed.** The test endpoint may be unavailable; see `/logs`.")
+            await status.edit(format_speedtest_error(error))
     finally:
         SPEEDTEST_RUNNING = False
 

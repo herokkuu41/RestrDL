@@ -97,7 +97,7 @@ and destination several times to assess improvement. Startup and final sends are
 
 Send `/speedtest` in the bot chat while transfers are idle. It measures HTTP latency and
 four-connection download/upload bandwidth against [Cloudflare's test endpoints](https://github.com/cloudflare/speedtest).
-It uses at most 96 MiB traffic and streams 64 KiB blocks without a disk file. A global
+It uses at most 48 MiB traffic and streams 64 KiB blocks without a disk file. A global
 five-minute cooldown and one-test limit prevent repeated tests competing for bandwidth.
 `/killall` cancels it; the overall deadline is 75 seconds. This samples the route to
 Cloudflare, not Telegram, and is not an Ookla result.
@@ -126,6 +126,19 @@ log. Existing environment values override defaults. Keep four connections, two d
 requests per connection and four upload requests per connection initially. A 64 MiB
 payload budget stays well within a 2 GB server without requiring full RAM/CPU utilization.
 Increase connection counts only when controlled measurements show a gain without waits.
+
+### Browser diagnostics capture
+
+The dependency-free Chrome extension in [`chrome-extension`](chrome-extension) captures
+browser-side failures in one AI-friendly JSON download. In Chrome, open
+`chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and select the
+`chrome-extension` folder. On the page with the problem, open DevTools, select **AI Capture**,
+press **Start capture**, reproduce the problem, then press **Stop & download**. It records
+HAR-style network data, safe capped response previews, console/error events, navigation and
+resource timing, and an optional capped DOM snapshot. Sensitive headers and common token query
+parameters are redacted locally. The capture is never uploaded by the extension; review the
+download before sharing it. See [`chrome-extension/README.md`](chrome-extension/README.md) for
+the data limits and full details.
 
 ### Run regression tests without modifying runtime files
 
