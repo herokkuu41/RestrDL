@@ -97,7 +97,7 @@ and destination several times to assess improvement. Startup and final sends are
 
 Send `/speedtest` in the bot chat while transfers are idle. It measures HTTP latency and
 four-connection download/upload bandwidth against [Cloudflare's test endpoints](https://github.com/cloudflare/speedtest).
-It uses at most 96 MiB traffic and streams 64 KiB blocks without a disk file. A global
+It uses at most 48 MiB traffic and streams 64 KiB blocks without a disk file. A global
 five-minute cooldown and one-test limit prevent repeated tests competing for bandwidth.
 `/killall` cancels it; the overall deadline is 75 seconds. This samples the route to
 Cloudflare, not Telegram, and is not an Ookla result.
