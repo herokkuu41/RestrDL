@@ -208,23 +208,85 @@ async def test_fatal_errors_propagate_and_drain(monkeypatch, error):
         await manager.close()
 
 
-async def test_source_relay_wait_retries_without_aborting_batch(monkeypatch):
-    monkeypatch.setattr(transfer, "_source_relay_gate", transfer.SourceRelayGate(1))
-    monkeypatch.setattr(transfer.PyroConf, "PREMIUM_WAIT_RETRIES", 2)
-    waited = []
-    async def wait(seconds, abort_event):
-        waited.append(seconds)
-        return True
-    monkeypatch.setattr(transfer, "wait_for_source_cooldown", wait)
-    attempts = 0
-    async def operation():
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise FloodPremiumWait(9)
-        return "sent"
-    assert await transfer.relay_after_premium_wait(operation) == "sent"
-    assert attempts == 2 and waited == [10]
+@pytest.mark.parametrize("direction", ["download", "upload"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direction, cancel):
+    """Use real pinned Session.invoke to prove only the refused RPC is repeated."""
+    from pyrogram.session import Session
+    backend = Backend(monkeypatch)
+    backend.size[1] = 12 * CHUNK_SIZE + 13
+    original = transfer.MTProtoWorkerSession
+    refused = False
+    attempts = defaultdict(int)
+    waits = []
+    waiting = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        if seconds == 9:
+            waits.append(seconds)
+            if cancel:
+                waiting.set()
+                await asyncio.Event().wait()
+            await real_sleep(0)
+        else:
+            await real_sleep(seconds)
+
+    class Worker(original):
+        WAIT_TIMEOUT = 2
+        def __init__(self, client, dc):
+            super().__init__(client, dc)
+            client.name = client.role
+            self.is_started = asyncio.Event()
+            self.is_started.set()
+
+        async def invoke(self, query, **kwargs):
+            assert kwargs["sleep_threshold"] == 30
+            return await Session.invoke(self, query, **kwargs)
+
+        async def send(self, query, timeout):
+            nonlocal refused
+            download = isinstance(query, raw.functions.upload.GetFile)
+            key = ("download", query.offset) if download else ("upload", query.file_part)
+            attempts[key] += 1
+            target = ("download", CHUNK_SIZE) if direction == "download" else ("upload", 1)
+            if key == target and not refused:
+                refused = True
+                raise FloodPremiumWait(9)
+            return await super().invoke(query)
+
+    monkeypatch.setattr(transfer, "MTProtoWorkerSession", Worker)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    source, bot = clients()
+    manager = TransferManager()
+    abort = asyncio.Event()
+    task = asyncio.create_task(manager.prepare(source, bot, message(backend.size[1]), abort_event=abort))
+    try:
+        if cancel:
+            await asyncio.wait_for(waiting.wait(), 2)
+            abort.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert manager.budget.used == 0
+            assert not any(backend.active_rpc.values())
+            return
+        uploaded = await task
+        assert waits == [9]
+        assert attempts[("download", 0)] == attempts[("upload", 0)] == 1
+        target = ("download", CHUNK_SIZE) if direction == "download" else ("upload", 1)
+        assert attempts[target] == 2
+        assert len(backend.parts) == 1, "the same upload handle must survive the wait"
+        assert b"".join(data for _, data in sorted(backend.parts[uploaded.file.id].items())) == backend.payload(backend.size[1])
+        assert manager.budget.used == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.close()
+
+
+def test_production_restores_single_request_per_connection():
+    assert transfer.PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION == 1
+    assert transfer.PyroConf.UPLOAD_REQUESTS_PER_CONNECTION == 1
 
 
 async def test_reference_refresh_once(monkeypatch):
@@ -560,7 +622,7 @@ async def test_pipeline_uses_multiple_rpcs_without_extra_connections(monkeypatch
         await manager.close()
 
 
-async def test_large_file_slow_first_chunk_does_not_block_upload(monkeypatch):
+async def test_restored_producer_enqueues_in_source_order(monkeypatch):
     backend = Backend(monkeypatch)
     backend.size[1] = 12 * CHUNK_SIZE
     source, bot = clients()
@@ -580,7 +642,7 @@ async def test_large_file_slow_first_chunk_does_not_block_upload(monkeypatch):
             if any(backend.parts.values()):
                 break
             await asyncio.sleep(0.005)
-        assert any(backend.parts.values()), "other chunks must upload before the slow first chunk"
+        assert not any(backend.parts.values()), "restored producer waits for the first source chunk"
         assert not task.done()
         first_chunk.set()
         result = await asyncio.wait_for(task, 2)

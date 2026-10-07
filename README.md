@@ -32,11 +32,10 @@
 
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
 uses four download and four upload connections across the entire bot, with at most two
-files active at once. Each download connection now permits two requests in flight and
-each upload connection four (8 download RPCs / 16 upload RPCs globally). Sending another
-part while awaiting earlier acknowledgements fills latency gaps; the old pipeline allowed
-only one request per connection. Large files enqueue completed chunks immediately rather
-than waiting for a slower earlier chunk. Small files retain ordered MD5 calculation.
+files active at once. Transfer scheduling is restored to the version before the
+07 October 2026 06:11 IST commit: one request in flight per connection (4 download
+RPCs / 4 upload RPCs globally), with chunks enqueued in source order. Downloads
+and uploads still overlap. Small files retain ordered MD5 calculation.
 Albums share these limits. Queued data, upload slices, and retry
 payloads have a shared 64 MiB budget; this is a payload budget, not a cap on total process
 RAM. TgCrypto is required and checked at startup.
@@ -50,11 +49,9 @@ The existing server-side copy/forward path remains the first choice when availab
 |---|---:|---|
 | `PARALLEL_DOWNLOAD_WORKERS` | 4 | Global download connection slots |
 | `PARALLEL_UPLOAD_WORKERS` | 4 | Global upload connection slots |
-| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 2 | Outstanding RPCs per download connection |
-| `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Outstanding RPCs per upload connection |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 1 | Fixed production RPCs per download connection; old overrides ignored |
+| `UPLOAD_REQUESTS_PER_CONNECTION` | 1 | Fixed production RPCs per upload connection; old overrides ignored |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
-| `SOURCE_RELAY_CONCURRENCY` | 1 | Protected-source files/albums in flight; each retains all 4 download lanes |
-| `PREMIUM_WAIT_RETRIES` | 3 | Automatic retries after Telegram's requested non-Premium wait |
 | `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
@@ -107,10 +104,12 @@ Cloudflare, not Telegram, and is not an Ookla result.
 Your target **7.5 MB/s equals 60 Mbps**, or approximately 7.15 MiB/s. A sample above
 60 Mbps in each direction shows headroom to Cloudflare, but cannot establish Telegram
 throughput. Telegram can limit non-Premium source downloads. A detected
-`FLOOD_PREMIUM_WAIT` now pauses and retries the current protected-source media/album
-automatically (up to three times), rather than aborting the whole batch. Protected-source
-relays are serialized so several batch items do not multiply that account-side throttle;
-each individual relay still uses its four download lanes. See [Telegram file transfer guidance](https://core.telegram.org/api/files)
+short waits (up to 30 seconds) are handled by the pinned library on the exact refused
+request, as in the earlier transfer version. Completed chunks, the upload file ID,
+and acknowledged parts are retained. The whole-file restart loop is removed for
+both single media and albums. Longer waits stop the batch instead of repeatedly
+starting files or moving to the next file while throttled. `/killall` cancels an
+in-progress wait. See [Telegram file transfer guidance](https://core.telegram.org/api/files)
 and [Premium download limits](https://telegram.org/faq_premium).
 
 `/logs` now includes transfer progress every 15 seconds, plus completion elapsed time,
@@ -126,8 +125,9 @@ chat pins use the sender's own message ID namespace. Sent responses and album co
 use the required `topics` field for Pyrofork 2.3.69, so completed sends are counted correctly.
 
 After deploying, restart with the new code and check the startup `Transfer settings`
-log. Existing environment values override defaults. Keep four connections, two download
-requests per connection and four upload requests per connection initially. A 64 MiB
+log. Connection-count environment values override defaults, but old 2/4 requests-per-connection
+values are ignored so existing deployments use the restored 1/1 scheduling automatically.
+Keep four connections. A 64 MiB
 payload budget stays well within a 2 GB server without requiring full RAM/CPU utilization.
 Increase connection counts only when controlled measurements show a gain without waits.
 

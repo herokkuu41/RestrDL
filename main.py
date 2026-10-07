@@ -730,13 +730,15 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             raise
 
         except FloodPremiumWait as e:
-            LOGGER(__name__).warning("Telegram source throttle remained after retries: FLOOD_PREMIUM_WAIT_%s", e.value)
+            LOGGER(__name__).warning("Telegram transfer throttle exceeded in-place wait threshold: FLOOD_PREMIUM_WAIT_%s", e.value)
+            if abort_event:
+                abort_event.set()
             await reply_temporary(message,
-                f"⏳ **Telegram download limit persists**\n\nTelegram still requires `{e.value}s` after automatic retries.\n"
-                "This item was skipped so the batch can continue; try it again later.")
+                f"⏳ **Telegram transfer limit**\n\nTelegram requires `{e.value}s` before this request.\n"
+                "The transfer has stopped. Let the account cooldown finish before starting another batch.")
             if progress_message:
                 await progress_message.delete()
-            return "error"
+            return "aborted"
 
         except FloodWait as e:
             if abort_event and not abort_event.is_set():

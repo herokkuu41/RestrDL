@@ -15,7 +15,7 @@ from pyrogram import raw, utils
 from pyrogram.enums import ParseMode
 from pyrogram.errors import (
     AuthKeyDuplicated, FilePartMissing, FileReferenceExpired, FileReferenceInvalid,
-    FloodWait, FloodPremiumWait, InternalServerError, ServiceUnavailable,
+    FloodWait, InternalServerError, ServiceUnavailable,
 )
 
 from config import PyroConf
@@ -25,63 +25,6 @@ from logger import LOGGER
 PART_SIZE = 512 * 1024
 TRANSIENT = (OSError, TimeoutError, InternalServerError, ServiceUnavailable)
 REFERENCES = (FileReferenceExpired, FileReferenceInvalid)
-_source_relay_gate = None
-
-
-class SourceRelayGate:
-    """Serializes source-account relays without reducing per-file lanes."""
-    def __init__(self, concurrency):
-        self.slots = asyncio.Semaphore(concurrency)
-
-
-def source_relay_gate():
-    global _source_relay_gate
-    if _source_relay_gate is None:
-        _source_relay_gate = SourceRelayGate(PyroConf.SOURCE_RELAY_CONCURRENCY)
-    return _source_relay_gate
-
-
-async def wait_for_source_cooldown(seconds, abort_event):
-    """Wait for Telegram's required delay, but let /killall interrupt it."""
-    if abort_event is None:
-        await asyncio.sleep(seconds)
-        return True
-    try:
-        await asyncio.wait_for(abort_event.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
-        return True
-    return False
-
-
-async def relay_after_premium_wait(operation, abort_event=None, progress_message=None):
-    """Retry a temporary source-account throttle instead of terminating a batch."""
-    async with source_relay_gate().slots:
-        for attempt in range(PyroConf.PREMIUM_WAIT_RETRIES + 1):
-            if abort_event and abort_event.is_set():
-                raise asyncio.CancelledError()
-            try:
-                return await operation()
-            except FloodPremiumWait as error:
-                if attempt >= PyroConf.PREMIUM_WAIT_RETRIES:
-                    raise
-                seconds = max(1, error.value) + 1
-                LOGGER(__name__).warning(
-                    "Telegram source throttle: waiting %ss before relay retry %s/%s",
-                    seconds, attempt + 1, PyroConf.PREMIUM_WAIT_RETRIES,
-                )
-                if progress_message:
-                    try:
-                        await progress_message.edit(
-                            "⏳ **TELEGRAM DOWNLOAD LIMIT**\n\n"
-                            f"Telegram requested a `{seconds}s` pause. The transfer will resume "
-                            f"automatically (`{attempt + 1}/{PyroConf.PREMIUM_WAIT_RETRIES}`)."
-                        )
-                    except (FloodWait, AuthKeyDuplicated, pyrogram.StopTransmission):
-                        raise
-                    except Exception:
-                        pass
-                if not await wait_for_source_cooldown(seconds, abort_event):
-                    raise asyncio.CancelledError()
 
 
 async def supervised(coroutines):
@@ -376,7 +319,7 @@ class TransferManager:
             async with self.downloads.lease(source, fid.dc_id) as worker:
                 response = await worker.session.invoke(raw.functions.upload.GetFile(
                     location=get_file_location(fid), offset=offset, limit=CHUNK_SIZE
-                ), sleep_threshold=0, retries=0)
+                ), sleep_threshold=30, retries=0)
             if isinstance(response, raw.types.upload.FileCdnRedirect):
                 raise CdnRedirect()
             if not isinstance(response, raw.types.upload.File) or len(response.bytes) != expected:
@@ -393,7 +336,7 @@ class TransferManager:
         ))
         async def operation():
             async with self.uploads.lease(bot, dc) as worker:
-                result = await worker.session.invoke(query, sleep_threshold=0, retries=0)
+                result = await worker.session.invoke(query, sleep_threshold=30, retries=0)
             if result is not True:
                 raise OSError(f"Telegram did not acknowledge upload part {part}")
         await retry(operation)
@@ -502,13 +445,9 @@ class TransferManager:
                         if offset is not None:
                             pending.append(asyncio.create_task(chunk(offset)))
                     while pending:
-                        if size <= 10 * CHUNK_SIZE:
-                            task = pending[0]  # MD5 requires source order.
-                        else:
-                            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                            # Observe failed RPCs before accepting other completed chunks.
-                            task = next((t for t in done if t.cancelled() or t.exception()), next(iter(done)))
-                            done = None  # Don't retain acknowledged chunk payloads.
+                        # Restore the pre-06:11 producer: fetch concurrently,
+                        # enqueue in source order, with one RPC per connection.
+                        task = pending[0]
                         pending.remove(task)
                         try:
                             offset, data, credit = await task
@@ -805,8 +744,7 @@ async def relay_media(source, bot, message, target, progress_message=None, abort
         )
         response = await finalize(bot, query, [upload], manager)
         return (await sent_messages(bot, response))[0]
-    return await relay_after_premium_wait(
-        lambda: abortable(operation(), abort_event), abort_event, progress_message)
+    return await abortable(operation(), abort_event)
 
 
 async def relay_album(source, bot, messages, target, progress_message=None, abort_event=None):
@@ -845,5 +783,4 @@ async def relay_album(source, bot, messages, target, progress_message=None, abor
             query = raw.functions.messages.SendMultiMedia(peer=peer, multi_media=items)
         response = await retry(lambda: bot.invoke(query))
         return await sent_messages(bot, response)
-    return await relay_after_premium_wait(
-        lambda: abortable(operation(), abort_event), abort_event, progress_message)
+    return await abortable(operation(), abort_event)

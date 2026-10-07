@@ -45,17 +45,18 @@ class PyroConf(object):
     PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
     PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "4"))
-    DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "2"))
-    UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))
+    # Restore the pre-06:11 single-RPC scheduling, even when deployment still
+    # contains the previous 2/4 environment overrides. Benchmark managers can
+    # explicitly request different scheduling without changing production.
+    DOWNLOAD_REQUESTS_PER_CONNECTION = 1
+    UPLOAD_REQUESTS_PER_CONNECTION = 1
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
-    SOURCE_RELAY_CONCURRENCY = int(getenv("SOURCE_RELAY_CONCURRENCY", "1"))
-    PREMIUM_WAIT_RETRIES = int(getenv("PREMIUM_WAIT_RETRIES", "3"))
     TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
 
     for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
                   "DOWNLOAD_REQUESTS_PER_CONNECTION", "UPLOAD_REQUESTS_PER_CONNECTION",
-                  "MAX_ACTIVE_TRANSFERS", "SOURCE_RELAY_CONCURRENCY", "PREMIUM_WAIT_RETRIES",
+                  "MAX_ACTIVE_TRANSFERS",
                   "TRANSFER_BUFFER_MIB", "DISK_RESERVE_MIB"):
         if locals()[_name] <= 0:
             raise ValueError(f"{_name} must be positive")
