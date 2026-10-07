@@ -8,17 +8,29 @@ from aiohttp import web
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, FloodWait, FloodPremiumWait, AuthKeyDuplicated
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
 
 from helpers.utils import (
     processMediaGroup,
-    refresh_progress_message
+    refresh_progress_message,
+    progressArgs,
+    progress_for_pyrogram,
+    get_media_info,
+    get_video_thumbnail
 )
 
 from helpers.files import (
     fileSizeLimit,
     get_readable_file_size,
-    get_readable_time
+    get_readable_time,
+    cleanup_download
+)
+
+from helpers.watch_board import (
+    extract_watch_board_url,
+    extract_title_and_filename,
+    resolve_video_cdn_url,
+    download_watch_board_video
 )
 
 from helpers.msg import (
@@ -516,6 +528,7 @@ async def start(_, message: Message):
         "or reply to a message with `/dl`.\n\n"
         "⚡ **TRANSFER TOOLS**\n"
         "Use `/batch` to clone/download multiple messages easily!\n"
+        "Use `/batch_watch` to download Watch Board videos in batch!\n"
         "Use `/set <channel_id>` to set a custom upload destination.\n"
         "Use `/speedtest` to measure this server's download, upload and latency.\n"
         "Batch mode first asks whether to **pin the first post** — tap a button or reply `yes` / `no`.\n\n"
@@ -543,6 +556,11 @@ async def help_command(_, message: Message):
         "   4. Answer the **📌 Pin the first post?** prompt (button, or reply `yes` / `no`) —\n"
         f"      it auto-continues without pinning after {PyroConf.PIN_PROMPT_TIMEOUT}s.\n"
         "   The bot will calculate the range and process them.\n\n"
+        "➤ **Watch Board Batch**\n"
+        "   1. Send `/batch_watch` (or `/batch_watch_board`)\n"
+        "   2. Send the **Start Link** of the first post\n"
+        "   3. Send the **Number of Messages**\n"
+        "   The bot downloads Watch Board videos directly and sends them.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
         "   – `/set none`: Reset to default (upload to the bot chat).\n"
@@ -840,14 +858,42 @@ async def batch_command_start(bot: Client, message: Message):
         user_id,
         "⌛ A new /batch was started, so this pin prompt is closed."
     )
-    BATCH_STATES[user_id] = {'step': 'ask_link'}
+    BATCH_STATES[user_id] = {'step': 'ask_link', 'mode': 'normal'}
     await message.reply(
         "🚀 **Batch Mode Initiated**\n\n"
         "Please send the **Start Link** of the first post you want to download."
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set", "speedtest"]))
+@bot.on_message(filters.command(["batch_watch", "batch_watch_board"]) & filters.private)
+async def batch_watch_command_start(bot: Client, message: Message):
+    user_id = message.from_user.id
+    if len(message.command) >= 3 and message.command[2].isdigit() and message.command[1].startswith("https://t.me/"):
+        start_link = message.command[1]
+        count = int(message.command[2])
+        if count <= 0:
+            await reply_temporary(message, "❌ Please send a valid positive number.")
+            return
+        await release_pending_prompt(
+            user_id,
+            "⌛ A new /batch_watch was started, so this pin prompt is closed."
+        )
+        BATCH_STATES.pop(user_id, None)
+        track_task(process_watch_board_batch(bot, message, start_link, count))
+        return
+
+    await release_pending_prompt(
+        user_id,
+        "⌛ A new /batch_watch was started, so this pin prompt is closed."
+    )
+    BATCH_STATES[user_id] = {'step': 'ask_link', 'mode': 'watch_board'}
+    await message.reply(
+        "🎬 **Watch Board Batch Mode Initiated**\n\n"
+        "Please send the **Start Link** of the first post containing the Watch Board video."
+    )
+
+
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "batch_watch", "batch_watch_board", "stats", "logs", "killall", "set", "speedtest"]))
 async def handle_text_and_states(bot: Client, message: Message):
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
@@ -868,14 +914,19 @@ async def handle_text_and_states(bot: Client, message: Message):
             return
 
         elif state['step'] == 'ask_count':
-            if not message.text.isdigit():
-                await reply_temporary(message, "❌ Please send a valid number.")
+            if not message.text.isdigit() or int(message.text) <= 0:
+                await reply_temporary(message, "❌ Please send a valid positive number.")
                 return
 
             count = int(message.text)
             start_link = BATCH_STATES[user_id]['start_link']
+            mode = BATCH_STATES[user_id].get('mode', 'normal')
 
             del BATCH_STATES[user_id]
+
+            if mode == 'watch_board':
+                track_task(process_watch_board_batch(bot, message, start_link, count))
+                return
 
             markup = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Yes, pin it", callback_data=f"pin_decision:yes:{user_id}"),
@@ -1178,6 +1229,290 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         f"❌ **Failed** : `{failed}`"
         + (f"\n🛑 **Cancelled** : `{cancelled}`" if cancelled else "")
     )
+
+
+async def process_watch_board_batch(
+    bot: Client,
+    message: Message,
+    start_link: str,
+    count: int,
+    abort_event: asyncio.Event = None,
+):
+    """Batch download and forward Watch Board videos directly from posts."""
+    if count <= 0:
+        return await reply_temporary(message, "**❌ Count must be at least 1.**")
+
+    clean_start_link = (start_link or "").split("?")[0].split("#")[0].strip()
+    try:
+        start_chat, start_id, start_thread_id = getChatMsgID(clean_start_link)
+    except Exception as e:
+        return await reply_temporary(message, f"**❌ Error parsing start link:\n{e}**")
+
+    end_id = start_id + count - 1
+    prefix = clean_start_link.rsplit("/", 1)[0]
+    thread_text = f"\n**Topic/Thread Filter Active**: ID `{start_thread_id}`" if start_thread_id else ""
+
+    loading = await message.reply(
+        f"🎬 **Starting Watch Board Batch Process**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 **From:** `{start_id}`  →  **To:** `{end_id}`\n"
+        f"🗂 **Total Range Checked:** `{count}` posts{thread_text}\n"
+        f"⚡ Direct CDN streaming (< 20MB RAM) • auto-forward to Telegram"
+    )
+
+    if abort_event is None:
+        abort_event = asyncio.Event()
+
+    batch_state = {"abort": abort_event, "cancelled": False}
+    ACTIVE_BATCHES[message.from_user.id] = batch_state
+
+    target_chat_id = await resolve_target_chat_id(bot, message)
+
+    downloaded = skipped = failed = 0
+    cancelled = 0
+
+    all_message_ids = list(range(start_id, end_id + 1))
+    chunk_size = 50
+
+    try:
+        for i in range(0, len(all_message_ids), chunk_size):
+            if abort_event.is_set():
+                break
+
+            chunk = all_message_ids[i:i + chunk_size]
+
+            try:
+                messages_batch = await user.get_messages(chat_id=start_chat, message_ids=chunk)
+            except FloodWait as e:
+                await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
+                abort_event.set()
+                break
+            except AuthKeyDuplicated:
+                await reply_temporary(
+                    message,
+                    "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n"
+                    "Telegram invalidated this session because the same `SESSION_STRING` was used elsewhere simultaneously.\n"
+                    "Please generate a new `SESSION_STRING` with @SmartUtilBot and ensure only one instance is running."
+                )
+                abort_event.set()
+                break
+            except Exception as e:
+                if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                    await reply_temporary(
+                        message,
+                        "🚨 **Session Conflict (AUTH_KEY_DUPLICATED)!**\n"
+                        "Telegram invalidated this session because the same `SESSION_STRING` was used elsewhere simultaneously."
+                    )
+                    abort_event.set()
+                    break
+                if "FLOOD_WAIT" in str(e).upper():
+                    await reply_temporary(message, "🚨 **Batch Halted: Read FloodWait Triggered!**")
+                    abort_event.set()
+                    break
+                LOGGER(__name__).error(f"Error reading chunk {chunk}: {e}")
+                failed += len(chunk)
+                await reply_temporary(message, f"**⚠️ Could not read {len(chunk)} message(s): {e}**")
+                continue
+
+            if not messages_batch:
+                messages_batch = []
+            elif getattr(messages_batch, "id", None) is not None:
+                messages_batch = [messages_batch]
+
+            for chat_msg in sorted(messages_batch, key=lambda m: getattr(m, "id", 0)):
+                if abort_event.is_set():
+                    break
+
+                if not chat_msg or getattr(chat_msg, 'empty', False):
+                    skipped += 1
+                    continue
+
+                if start_thread_id:
+                    msg_thread = getattr(chat_msg, "message_thread_id", None)
+                    if msg_thread != start_thread_id:
+                        skipped += 1
+                        continue
+
+                board_url = extract_watch_board_url(chat_msg)
+                if not board_url:
+                    LOGGER(__name__).info(f"Post {chat_msg.id} has no Watch Board URL, skipping.")
+                    skipped += 1
+                    continue
+
+                # Process this Watch Board post
+                progress_msg = None
+                downloaded_file = None
+                thumb_path = None
+                dest_dir = None
+                try:
+                    progress_msg = await message.reply(f"🔍 **Resolving Watch Board Video:** Post `{chat_msg.id}`...")
+                    cdn_url = await resolve_video_cdn_url(board_url)
+                    if not cdn_url:
+                        LOGGER(__name__).warning(f"Failed to resolve CDN URL for post {chat_msg.id} ({board_url})")
+                        await progress_msg.edit(f"⚠️ **Could not resolve video stream for post `{chat_msg.id}`.**")
+                        schedule_delete(progress_msg, 10)
+                        failed += 1
+                        continue
+
+                    raw_caption = chat_msg.caption or chat_msg.text or ""
+                    title, safe_filename = extract_title_and_filename(raw_caption, chat_msg.id)
+                    task_id = f"wb_{message.from_user.id}_{chat_msg.id}_{int(time())}"
+                    dest_dir = os.path.join("downloads", task_id)
+                    dest_path = os.path.join(dest_dir, safe_filename)
+
+                    start_dl_time = time()
+                    dl_args = progressArgs("Downloading Watch Board", progress_msg, start_dl_time)
+                    await progress_msg.edit(f"📥 **Downloading Watch Board Video:** `{safe_filename}`...")
+
+                    downloaded_file = await download_watch_board_video(
+                        cdn_url, dest_path,
+                        progress=progress_for_pyrogram,
+                        progress_args=dl_args,
+                        abort_event=abort_event
+                    )
+
+                    if abort_event.is_set():
+                        if progress_msg:
+                            try:
+                                await progress_msg.delete()
+                            except Exception:
+                                pass
+                        break
+
+                    if not downloaded_file or not os.path.exists(downloaded_file):
+                        LOGGER(__name__).error(f"Download returned no file for post {chat_msg.id}")
+                        await progress_msg.edit(f"❌ **Download failed for post `{chat_msg.id}`.**")
+                        schedule_delete(progress_msg, 10)
+                        failed += 1
+                        continue
+
+                    # Media info & thumbnail
+                    duration, artist, meta_title, width, height = await get_media_info(downloaded_file)
+                    thumb_path = await get_video_thumbnail(downloaded_file, duration)
+
+                    start_ul_time = time()
+                    ul_args = progressArgs("Uploading Watch Board", progress_msg, start_ul_time)
+                    caption = raw_caption if raw_caption else f"**{title}**"
+                    caption_entities = getattr(chat_msg, "caption_entities", None)
+                    if len(caption) > 1024:
+                        caption = caption[:1020] + "..."
+                        if caption_entities:
+                            max_len = len(caption)
+                            safe_entities = []
+                            for ent in caption_entities:
+                                if ent.offset < max_len:
+                                    clamped_len = min(ent.length, max_len - ent.offset)
+                                    if clamped_len > 0:
+                                        ent_copy = MessageEntity(
+                                            type=ent.type,
+                                            offset=ent.offset,
+                                            length=clamped_len,
+                                            url=getattr(ent, "url", None),
+                                            user=getattr(ent, "user", None),
+                                            language=getattr(ent, "language", None),
+                                            custom_emoji_id=getattr(ent, "custom_emoji_id", None)
+                                        )
+                                        safe_entities.append(ent_copy)
+                            caption_entities = safe_entities if safe_entities else None
+
+                    send_kwargs = {
+                        "chat_id": target_chat_id,
+                        "video": downloaded_file,
+                        "caption": caption,
+                        "duration": duration or 0,
+                        "width": width or 0,
+                        "height": height or 0,
+                        "file_name": safe_filename,
+                        "supports_streaming": True,
+                        "progress": progress_for_pyrogram,
+                        "progress_args": ul_args,
+                    }
+                    if thumb_path and os.path.exists(thumb_path):
+                        send_kwargs["thumb"] = thumb_path
+                    if caption_entities:
+                        send_kwargs["caption_entities"] = caption_entities
+
+                    await bot.send_video(**send_kwargs)
+                    downloaded += 1
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+
+                except asyncio.CancelledError:
+                    cancelled += 1
+                    raise
+                except FloodWait as fw:
+                    LOGGER(__name__).warning(f"FloodWait during watch board upload: {fw.value}s")
+                    if fw.value > PyroConf.FLOOD_WAIT_DELAY:
+                        if not abort_event.is_set():
+                            abort_event.set()
+                        await reply_temporary(message, f"🚨 **FloodWait Triggered ({fw.value}s)!**\nProcess Aborted.")
+                        if progress_msg:
+                            try:
+                                await progress_msg.delete()
+                            except Exception:
+                                pass
+                        failed += 1
+                        break
+                    else:
+                        await asyncio.sleep(fw.value)
+                        failed += 1
+                except Exception as e:
+                    LOGGER(__name__).error(f"Failed processing Watch Board post {chat_msg.id}: {e}")
+                    failed += 1
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(f"❌ **Error on post `{chat_msg.id}`:** `{e}`")
+                            schedule_delete(progress_msg, 10)
+                        except Exception:
+                            pass
+                finally:
+                    if downloaded_file:
+                        cleanup_download(downloaded_file)
+                    if thumb_path and os.path.exists(thumb_path):
+                        try:
+                            os.remove(thumb_path)
+                        except Exception:
+                            pass
+                    if dest_dir and os.path.isdir(dest_dir):
+                        try:
+                            if not os.listdir(dest_dir):
+                                os.rmdir(dest_dir)
+                        except Exception:
+                            pass
+
+                if not abort_event.is_set():
+                    await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+
+    except asyncio.CancelledError:
+        batch_state["cancelled"] = True
+    finally:
+        ACTIVE_BATCHES.pop(message.from_user.id, None)
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+
+        if batch_state["cancelled"]:
+            completion_text = "**🛑 Watch Board Batch Process Cancelled (/killall)**"
+        elif abort_event.is_set():
+            completion_text = "**🛑 Watch Board Batch Process Stopped (FloodWait)**"
+        else:
+            completion_text = "**✅ Watch Board Batch Process Complete!**"
+
+        try:
+            await message.reply(
+                f"{completion_text}\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 **Processed** : `{downloaded}`\n"
+                f"⏭️ **Skipped** : `{skipped}`\n"
+                f"❌ **Failed** : `{failed}`"
+                + (f"\n🛑 **Cancelled** : `{cancelled}`" if cancelled else "")
+            )
+        except Exception:
+            pass
+
 
 @bot.on_message(filters.command("stats") & filters.private)
 async def stats(_, message: Message):
