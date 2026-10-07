@@ -26,31 +26,6 @@ if not hasattr(pyrogram.errors, "FloodPremiumWait"):
             self.value = value
     pyrogram.errors.FloodPremiumWait = FloodPremiumWait
 
-import importlib.metadata
-_orig_version = importlib.metadata.version
-def _shim_version(name):
-    if name.lower() == "pyrofork":
-        return "2.3.69"
-    return _orig_version(name)
-importlib.metadata.version = _shim_version
-
-from pyrogram import raw, utils
-_orig_messages_init = raw.types.messages.Messages.__init__
-_topics_store = {}
-raw.types.messages.Messages.topics = property(
-    lambda self: _topics_store.get(id(self), []),
-    lambda self, val: _topics_store.__setitem__(id(self), val)
-)
-def _shim_messages_init(self, *args, **kwargs):
-    topics = kwargs.pop("topics", None)
-    _orig_messages_init(self, *args, **kwargs)
-    self.topics = topics or []
-raw.types.messages.Messages.__init__ = _shim_messages_init
-
-_orig_get_input_media = utils.get_input_media_from_file_id
-def _shim_get_input_media(file_id, *args, **kwargs):
-    kwargs.pop("has_spoiler", None)
-    return _orig_get_input_media(file_id, *args, **kwargs)
-utils.get_input_media_from_file_id = _shim_get_input_media
+# Use actual pinned Pyrofork constructors/parser, not version or topics shims.
 
 import test_pin_feature  # noqa: F401

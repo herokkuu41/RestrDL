@@ -213,7 +213,8 @@ async def download_watch_board_video(
     dest_path: str,
     progress: Optional[Callable] = None,
     progress_args: tuple = (),
-    abort_event: Optional[asyncio.Event] = None
+    abort_event: Optional[asyncio.Event] = None,
+    max_size: Optional[int] = None,
 ) -> Optional[str]:
     """Stream WebM video in 1 MiB chunks to disk, checking DISK_RESERVE_MIB and abort_event."""
     if not cdn_url or not dest_path:
@@ -236,10 +237,22 @@ async def download_watch_board_video(
                     LOGGER(__name__).error(f"Download failed with HTTP {resp.status} for {cdn_url}")
                     return None
 
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if "text/html" in content_type or "json" in content_type:
+                    raise ValueError("Source returned a web page, not a video")
+                if resp.status == 206:
+                    content_range = resp.headers.get("Content-Range", "")
+                    match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range)
+                    if not match or int(match[1]) + 1 != int(match[2]):
+                        raise ValueError("Source returned an incomplete range, not the whole video")
+
                 try:
                     total_size = int(resp.headers.get("Content-Length", 0) or 0)
                 except (ValueError, TypeError):
                     total_size = 0
+
+                if max_size and total_size > max_size:
+                    raise ValueError("Source video exceeds the destination upload limit")
 
                 free_space = shutil.disk_usage(dest_dir).free
                 if total_size > 0 and (free_space - total_size < reserve_bytes):
@@ -256,12 +269,14 @@ async def download_watch_board_video(
                             LOGGER(__name__).info("Watch board download aborted by abort_event")
                             return None
 
-                        if shutil.disk_usage(dest_dir).free < reserve_bytes:
+                        if shutil.disk_usage(dest_dir).free - len(chunk) < reserve_bytes:
                             LOGGER(__name__).error("Disk space fell below DISK_RESERVE_MIB during download")
                             return None
 
                         f.write(chunk)
                         downloaded += len(chunk)
+                        if max_size and downloaded > max_size:
+                            raise ValueError("Source video exceeds the destination upload limit")
 
                         if progress:
                             try:
@@ -282,6 +297,9 @@ async def download_watch_board_video(
                 if downloaded == 0:
                     LOGGER(__name__).error(f"Downloaded 0 bytes from {cdn_url}")
                     return None
+
+                if total_size and downloaded != total_size:
+                    raise ValueError(f"Truncated video: expected {total_size} bytes, received {downloaded}")
 
                 if progress:
                     try:

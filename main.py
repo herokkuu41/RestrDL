@@ -32,6 +32,9 @@ from helpers.watch_board import (
     resolve_video_cdn_url,
     download_watch_board_video
 )
+from helpers.watch_board_render import (
+    uses_board_player, extract_password, load_board_events, render_board_video, get_board_video_info,
+)
 
 from helpers.msg import (
     getChatMsgID,
@@ -1342,6 +1345,7 @@ async def process_watch_board_batch(
                 # Process this Watch Board post
                 progress_msg = None
                 downloaded_file = None
+                camera_file = None
                 thumb_path = None
                 dest_dir = None
                 try:
@@ -1356,11 +1360,20 @@ async def process_watch_board_batch(
 
                     raw_caption = chat_msg.caption or chat_msg.text or ""
                     title, safe_filename = extract_title_and_filename(raw_caption, chat_msg.id)
+                    board_events = None
+                    if uses_board_player(board_url):
+                        await progress_msg.edit("🔓 **Unlocking original board slides and handwriting…**")
+                        source_media = getattr(chat_msg, "video", None) or getattr(chat_msg, "document", None)
+                        password = extract_password(raw_caption) or extract_password(
+                            getattr(source_media, "file_name", "")
+                        )
+                        board_events = await load_board_events(board_url, cdn_url, password)
                     task_id = f"wb_{message.from_user.id}_{chat_msg.id}_{int(time())}"
                     dest_dir = os.path.join("downloads", task_id)
                     dest_path = os.path.join(dest_dir, safe_filename)
 
                     start_dl_time = time()
+                    uploaded_limit = (4000 if getattr(getattr(bot, "me", None), "is_premium", False) else 2000) * 1048576
                     dl_args = progressArgs("Downloading Watch Board", progress_msg, start_dl_time)
                     await progress_msg.edit(f"📥 **Downloading Watch Board Video:** `{safe_filename}`...")
 
@@ -1368,7 +1381,8 @@ async def process_watch_board_batch(
                         cdn_url, dest_path,
                         progress=progress_for_pyrogram,
                         progress_args=dl_args,
-                        abort_event=abort_event
+                        abort_event=abort_event,
+                        max_size=uploaded_limit,
                     )
 
                     if abort_event.is_set():
@@ -1386,9 +1400,40 @@ async def process_watch_board_batch(
                         failed += 1
                         continue
 
+                    if board_events is not None:
+                        camera_file = downloaded_file
+                        safe_filename = os.path.splitext(safe_filename)[0] + ".mp4"
+                        output_path = os.path.join(dest_dir, safe_filename)
+                        await progress_msg.edit(
+                            "🎨 **Rendering Board + Face**\n"
+                            "Original slides + timed handwriting + teacher audio/video.\n"
+                            "This encoding stage can take several minutes; it is not a download."
+                        )
+
+                        async def render_progress(current, total):
+                            try:
+                                await progress_msg.edit(
+                                    "🎨 **Rendering Board + Face**\n"
+                                    f"Timeline: `{get_readable_time(int(current))}` / "
+                                    f"`{get_readable_time(int(total))}` ({current / total * 100:.1f}%)\n"
+                                    "No camera-only fallback; board text is included."
+                                )
+                            except Exception:
+                                pass
+
+                        downloaded_file = await render_board_video(
+                            camera_file, board_events, output_path, abort_event, render_progress,
+                            max_size=uploaded_limit,
+                        )
+                        LOGGER(__name__).info("Post %s: sending board-and-face export, not Telegram source media", chat_msg.id)
+
                     # Media info & thumbnail
                     duration, artist, meta_title, width, height = await get_media_info(downloaded_file)
-                    thumb_path = await get_video_thumbnail(downloaded_file, duration)
+                    if board_events is not None and not all((duration, width, height)):
+                        duration, artist, meta_title, width, height = await get_board_video_info(downloaded_file)
+                    thumb_path = await get_video_thumbnail(
+                        downloaded_file, duration, output_path=os.path.join(dest_dir, "thumbnail.jpg"),
+                    )
 
                     start_ul_time = time()
                     ul_args = progressArgs("Uploading Watch Board", progress_msg, start_ul_time)
@@ -1432,7 +1477,9 @@ async def process_watch_board_batch(
                     if caption_entities:
                         send_kwargs["caption_entities"] = caption_entities
 
-                    await bot.send_video(**send_kwargs)
+                    sent_message = await bot.send_video(**send_kwargs)
+                    if not sent_message:
+                        raise ValueError("Telegram did not acknowledge the sent video")
                     downloaded += 1
                     try:
                         await progress_msg.delete()
@@ -1470,6 +1517,8 @@ async def process_watch_board_batch(
                 finally:
                     if downloaded_file:
                         cleanup_download(downloaded_file)
+                    if camera_file and camera_file != downloaded_file:
+                        cleanup_download(camera_file)
                     if thumb_path and os.path.exists(thumb_path):
                         try:
                             os.remove(thumb_path)

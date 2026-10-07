@@ -53,6 +53,16 @@ class PyroConf(object):
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
     TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
+    # Board vector rendering, separate from unchanged Telegram transfer settings.
+    WATCH_BOARD_WIDTH = int(getenv("WATCH_BOARD_WIDTH", "1920"))
+    WATCH_BOARD_HEIGHT = int(getenv("WATCH_BOARD_HEIGHT", "1080"))
+    WATCH_BOARD_FPS = int(getenv("WATCH_BOARD_FPS", "8"))
+    WATCH_BOARD_CRF = int(getenv("WATCH_BOARD_CRF", "16"))
+    if (not 640 <= WATCH_BOARD_WIDTH <= 1920 or not 360 <= WATCH_BOARD_HEIGHT <= 1080
+            or WATCH_BOARD_WIDTH % 2 or WATCH_BOARD_HEIGHT % 2):
+        raise ValueError("Watch Board dimensions must be even, within 640..1920 by 360..1080")
+    if not 1 <= WATCH_BOARD_FPS <= 15 or not 0 <= WATCH_BOARD_CRF <= 23:
+        raise ValueError("Watch Board FPS must be 1..15 and CRF 0..23")
 
     for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
                   "DOWNLOAD_REQUESTS_PER_CONNECTION", "UPLOAD_REQUESTS_PER_CONNECTION",

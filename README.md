@@ -242,6 +242,55 @@ If you prefer to run inside a Docker container:
 - **`/logs`** – Download the bot’s logs file.  
 - **`/stats`** – View current status (uptime, disk, memory, network, CPU, etc.).  
 - **`/speedtest`** – Measure server download/upload bandwidth and HTTP latency while idle.
+- **`/batch_watch <Telegram start link> <count>`** (also `/batch_watch_board`) –
+  Export lessons linked through **Watch Board & Face**. Send the command without
+  arguments for the guided link/count prompts. This is separate from `/batch`.
+
+### Watch Board & Face quality
+
+The supported `unacadamy-panel-api.vercel.app` player is **not a single HD video**.
+Its `?url=.../output.webm` is the teacher/camera track; slides and timed pen strokes
+come from its password-protected `/api/load-video` API. The old downloader only
+saved the camera track, which left out the board. `/batch_watch` now reads
+`[PASS ABC123]`, `[PASS: ABC123]`, or `Password: ABC123` from the source caption or
+media filename, authenticates normally with the player's cookie/request token,
+and combines the original slide images, timed vector handwriting, and teacher
+video/audio into a full-length MP4. The filename comes from the source title.
+
+Default board panel: **1920×1080**, separate camera column (up to 640 pixels wide),
+H.264 **CRF 16**, AAC audio 192 kbps. Teacher frame rate is retained; handwriting
+updates at 8 fps. The camera does not cover board text. This is a composed export,
+not an untouched original HD recording: if the CDN camera is 640×360 or slides
+are 760×427, no extra photographic detail can be invented by enlarging them.
+Vector ink is rendered at the chosen board resolution. There is no verified
+higher-resolution camera variant at the supplied `output.webm` URL, so the bot
+does not guess “1080p” URLs or silently use Telegram's source attachment.
+
+Board rendering takes CPU time and can be considerably slower than plain
+download/upload. It uses **one encoder globally**, two encoder threads, four
+cached slide images, and a bounded frame pipe—no Chromium or retained frame
+sequence. The camera file plus the finished MP4 need disk space. Both are cleaned
+up after delivery/failure; incomplete output is never sent. The 256 MiB disk
+reserve and destination upload limit are enforced. Authentication, missing slide,
+unknown drawing-mode, and changed API errors fail explicitly without sending a
+camera-only replacement. Normal Telegram `/batch` concurrency is unchanged.
+
+Optional deployment overrides (defaults shown in `config.env.sample`):
+`WATCH_BOARD_WIDTH` (640–1920, even), `WATCH_BOARD_HEIGHT` (360–1080, even),
+`WATCH_BOARD_FPS` (1–15), and `WATCH_BOARD_CRF` (0–23; smaller means better
+quality/larger files). These do not control the resolution served by the CDN.
+
+For opt-in live verification without opening a Telegram session, run
+`tools/watch_board_probe.py <player-url> --output <temporary-directory>` from a
+disposable working directory, set `WATCH_BOARD_TEST_PASSWORD` in the environment,
+and use test placeholders for `BOT_TOKEN` / `SESSION_STRING`. The probe exports
+a 30-second diagnostic clip by default; `--start` selects its timeline position
+and `--seconds` changes its length. **Batch exports always use full duration.**
+Live checks replayed all 17,141 events in the supplied two-hour lesson and
+visually verified short slide/handwriting clips. The 30-second 2560×1080 export
+peaked at about 688 MiB for Python plus FFmpeg locally. This is not a production
+server benchmark: Telegram delivery and a full-length encode on the 2 GB server
+still require deployment verification.
 
 > **Note:** Make sure that your user session account is a member of the source chat or channel before downloading.
 

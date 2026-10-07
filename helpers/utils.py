@@ -161,9 +161,9 @@ async def get_media_info(path):
     return 0, None, None, None, None
 
 
-async def get_video_thumbnail(video_file, duration):
-    os.makedirs("Assets", exist_ok=True)
-    output = os.path.join("Assets", "video_thumb.jpg")
+async def get_video_thumbnail(video_file, duration, output_path=None):
+    output = output_path or os.path.join("Assets", "video_thumb.jpg")
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
 
     if duration is None:
         duration = (await get_media_info(video_file))[0]
