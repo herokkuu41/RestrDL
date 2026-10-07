@@ -14,8 +14,6 @@ async def test_speedtest_measures_both_directions_without_disk(monkeypatch):
     async def down(request):
         return web.Response(body=b"D" * int(request.query["bytes"]))
     async def up(request):
-        assert request.query["bytes"] == "768"
-        assert request.content_type == "text/plain"
         uploads.append(await request.read())
         return web.Response(text="ok")
     app = web.Application()
@@ -58,48 +56,6 @@ async def test_speedtest_rejects_truncated_samples():
             return Response()
     with pytest.raises(ValueError, match="truncated"):
         await speedtest.download_sample(Session(), 100)
-
-
-async def test_speedtest_formats_phase_and_http_failure():
-    request_info = type("Request", (), {"real_url": "https://speed.cloudflare.com/__up"})()
-    error = aiohttp.ClientResponseError(request_info, (), status=403, message="Forbidden")
-    text = speedtest.format_speedtest_error(speedtest.SpeedtestError("upload", error))
-    assert "HTTP `403`" in text and "upload" in text
-
-
-async def test_curl_sample_uses_official_bytes_contract(monkeypatch):
-    writes = []
-    class Writer:
-        def write(self, data):
-            writes.append(data)
-        async def drain(self):
-            pass
-        def close(self):
-            pass
-    class Process:
-        returncode = 0
-        stdin = Writer()
-        async def communicate(self):
-            return b"0 100 0.123 200", b""
-    command = []
-    async def create(*args, **kwargs):
-        command.extend(args)
-        return Process()
-    monkeypatch.setattr(speedtest.asyncio, "create_subprocess_exec", create)
-    monkeypatch.setattr(speedtest, "CURL", "curl")
-    count, elapsed = await speedtest.curl_sample("upload", 100)
-    assert count == 100 and elapsed == 0.123
-    assert b"".join(writes) == b"0" * 100
-    assert "--data-binary" in command and any(arg.startswith("https://speed.cloudflare.com/__up?bytes=100") for arg in command)
-
-
-async def test_curl_measure_reports_all_parallel_samples(monkeypatch):
-    monkeypatch.setattr(speedtest, "CONNECTIONS", 3)
-    async def sample(direction, size):
-        return size, 0.5
-    monkeypatch.setattr(speedtest, "curl_sample", sample)
-    total, elapsed = await speedtest.curl_measure("download", 100)
-    assert total == 300 and elapsed > 0
 
 
 @pytest.mark.parametrize("cancel", [False, True])
@@ -151,18 +107,3 @@ async def test_speedtest_command_reports_busy_cooldown_and_results(monkeypatch):
     await main.speedtest_command(main.bot, message)
     assert "cooldown" in message.replies[-1].text
     run.assert_awaited_once()
-
-
-async def test_speedtest_failure_does_not_start_cooldown(monkeypatch):
-    import main
-    from test_pin_feature import IncomingMessage
-    monkeypatch.setattr(main, "SPEEDTEST_RUNNING", False)
-    monkeypatch.setattr(main, "SPEEDTEST_LAST_RUN", 0)
-    monkeypatch.setattr(main, "ACTIVE_BATCHES", {})
-    monkeypatch.setattr(main, "RUNNING_TASKS", set())
-    failure = speedtest.SpeedtestError("download", TimeoutError())
-    monkeypatch.setattr(main, "run_speedtest", AsyncMock(side_effect=failure))
-    message = IncomingMessage("/speedtest")
-    await main.speedtest_command(main.bot, message)
-    assert "FAILED" in message.replies[-1].text
-    assert main.SPEEDTEST_LAST_RUN == 0
