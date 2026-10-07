@@ -15,7 +15,7 @@ from pyrogram import raw, utils
 from pyrogram.enums import ParseMode
 from pyrogram.errors import (
     AuthKeyDuplicated, FilePartMissing, FileReferenceExpired, FileReferenceInvalid,
-    FloodWait, InternalServerError, ServiceUnavailable,
+    FloodWait, FloodPremiumWait, InternalServerError, ServiceUnavailable,
 )
 
 from config import PyroConf
@@ -25,6 +25,63 @@ from logger import LOGGER
 PART_SIZE = 512 * 1024
 TRANSIENT = (OSError, TimeoutError, InternalServerError, ServiceUnavailable)
 REFERENCES = (FileReferenceExpired, FileReferenceInvalid)
+_source_relay_gate = None
+
+
+class SourceRelayGate:
+    """Serializes source-account relays without reducing per-file lanes."""
+    def __init__(self, concurrency):
+        self.slots = asyncio.Semaphore(concurrency)
+
+
+def source_relay_gate():
+    global _source_relay_gate
+    if _source_relay_gate is None:
+        _source_relay_gate = SourceRelayGate(PyroConf.SOURCE_RELAY_CONCURRENCY)
+    return _source_relay_gate
+
+
+async def wait_for_source_cooldown(seconds, abort_event):
+    """Wait for Telegram's required delay, but let /killall interrupt it."""
+    if abort_event is None:
+        await asyncio.sleep(seconds)
+        return True
+    try:
+        await asyncio.wait_for(abort_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return True
+    return False
+
+
+async def relay_after_premium_wait(operation, abort_event=None, progress_message=None):
+    """Retry a temporary source-account throttle instead of terminating a batch."""
+    async with source_relay_gate().slots:
+        for attempt in range(PyroConf.PREMIUM_WAIT_RETRIES + 1):
+            if abort_event and abort_event.is_set():
+                raise asyncio.CancelledError()
+            try:
+                return await operation()
+            except FloodPremiumWait as error:
+                if attempt >= PyroConf.PREMIUM_WAIT_RETRIES:
+                    raise
+                seconds = max(1, error.value) + 1
+                LOGGER(__name__).warning(
+                    "Telegram source throttle: waiting %ss before relay retry %s/%s",
+                    seconds, attempt + 1, PyroConf.PREMIUM_WAIT_RETRIES,
+                )
+                if progress_message:
+                    try:
+                        await progress_message.edit(
+                            "⏳ **TELEGRAM DOWNLOAD LIMIT**\n\n"
+                            f"Telegram requested a `{seconds}s` pause. The transfer will resume "
+                            f"automatically (`{attempt + 1}/{PyroConf.PREMIUM_WAIT_RETRIES}`)."
+                        )
+                    except (FloodWait, AuthKeyDuplicated, pyrogram.StopTransmission):
+                        raise
+                    except Exception:
+                        pass
+                if not await wait_for_source_cooldown(seconds, abort_event):
+                    raise asyncio.CancelledError()
 
 
 async def supervised(coroutines):
@@ -748,7 +805,8 @@ async def relay_media(source, bot, message, target, progress_message=None, abort
         )
         response = await finalize(bot, query, [upload], manager)
         return (await sent_messages(bot, response))[0]
-    return await abortable(operation(), abort_event)
+    return await relay_after_premium_wait(
+        lambda: abortable(operation(), abort_event), abort_event, progress_message)
 
 
 async def relay_album(source, bot, messages, target, progress_message=None, abort_event=None):
@@ -787,4 +845,5 @@ async def relay_album(source, bot, messages, target, progress_message=None, abor
             query = raw.functions.messages.SendMultiMedia(peer=peer, multi_media=items)
         response = await retry(lambda: bot.invoke(query))
         return await sent_messages(bot, response)
-    return await abortable(operation(), abort_event)
+    return await relay_after_premium_wait(
+        lambda: abortable(operation(), abort_event), abort_event, progress_message)

@@ -730,16 +730,13 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             raise
 
         except FloodPremiumWait as e:
-            LOGGER(__name__).warning("Telegram account download throttle: FLOOD_PREMIUM_WAIT_%s", e.value)
-            if abort_event:
-                abort_event.set()
+            LOGGER(__name__).warning("Telegram source throttle remained after retries: FLOOD_PREMIUM_WAIT_%s", e.value)
             await reply_temporary(message,
-                f"⏳ **Telegram download limit**\n\nTelegram requires `{e.value}s` before another request.\n"
-                "The source account's non-Premium download limit is active. More RAM or upload workers "
-                "cannot remove this limit. The batch has stopped; wait before trying again.")
+                f"⏳ **Telegram download limit persists**\n\nTelegram still requires `{e.value}s` after automatic retries.\n"
+                "This item was skipped so the batch can continue; try it again later.")
             if progress_message:
                 await progress_message.delete()
-            return "aborted"
+            return "error"
 
         except FloodWait as e:
             if abort_event and not abort_event.is_set():
@@ -1227,7 +1224,7 @@ async def speedtest_command(_, message: Message):
     try:
         status = await message.reply(
             "🌐 **SERVER SPEED TEST**\n\n📡 Measuring latency, download and upload…\n"
-            "Cloudflare endpoint • up to 96 MiB traffic • no disk buffer\n"
+            "Cloudflare endpoint • up to 48 MiB traffic • no disk buffer\n"
             "⏱ Usually under a minute. Cancel with `/killall`.")
         result = await track_task(run_speedtest())
         await status.edit(format_speedtest(result))

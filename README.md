@@ -53,6 +53,8 @@ The existing server-side copy/forward path remains the first choice when availab
 | `DOWNLOAD_REQUESTS_PER_CONNECTION` | 2 | Outstanding RPCs per download connection |
 | `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Outstanding RPCs per upload connection |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
+| `SOURCE_RELAY_CONCURRENCY` | 1 | Protected-source files/albums in flight; each retains all 4 download lanes |
+| `PREMIUM_WAIT_RETRIES` | 3 | Automatic retries after Telegram's requested non-Premium wait |
 | `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
@@ -104,9 +106,11 @@ Cloudflare, not Telegram, and is not an Ookla result.
 
 Your target **7.5 MB/s equals 60 Mbps**, or approximately 7.15 MiB/s. A sample above
 60 Mbps in each direction shows headroom to Cloudflare, but cannot establish Telegram
-throughput. Telegram can limit non-Premium source downloads; detected
-`FLOOD_PREMIUM_WAIT` now stops the batch with an explanation instead of silently waiting
-inside a worker. See [Telegram file transfer guidance](https://core.telegram.org/api/files)
+throughput. Telegram can limit non-Premium source downloads. A detected
+`FLOOD_PREMIUM_WAIT` now pauses and retries the current protected-source media/album
+automatically (up to three times), rather than aborting the whole batch. Protected-source
+relays are serialized so several batch items do not multiply that account-side throttle;
+each individual relay still uses its four download lanes. See [Telegram file transfer guidance](https://core.telegram.org/api/files)
 and [Premium download limits](https://telegram.org/faq_premium).
 
 `/logs` now includes transfer progress every 15 seconds, plus completion elapsed time,

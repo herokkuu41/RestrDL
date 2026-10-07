@@ -208,6 +208,25 @@ async def test_fatal_errors_propagate_and_drain(monkeypatch, error):
         await manager.close()
 
 
+async def test_source_relay_wait_retries_without_aborting_batch(monkeypatch):
+    monkeypatch.setattr(transfer, "_source_relay_gate", transfer.SourceRelayGate(1))
+    monkeypatch.setattr(transfer.PyroConf, "PREMIUM_WAIT_RETRIES", 2)
+    waited = []
+    async def wait(seconds, abort_event):
+        waited.append(seconds)
+        return True
+    monkeypatch.setattr(transfer, "wait_for_source_cooldown", wait)
+    attempts = 0
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FloodPremiumWait(9)
+        return "sent"
+    assert await transfer.relay_after_premium_wait(operation) == "sent"
+    assert attempts == 2 and waited == [10]
+
+
 async def test_reference_refresh_once(monkeypatch):
     backend = Backend(monkeypatch)
     backend.error = FileReferenceExpired()
