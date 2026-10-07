@@ -58,8 +58,8 @@ async def run_pip_batch(bot, source_client, message, start_link, count, *,
         loading = await message.reply(
             "🎞 **Board-first Video Batch**\n"
             f"🔗 Posts `{start_id}` → `{start_id+count-1}`\n"
-            "📝 Original board + handwriting • teacher at bottom-left\n"
-            f"⚙ Teacher/output up to {PyroConf.WATCH_BOARD_PIP_FPS} fps; encoding required.\n"
+            "📝 Board on the left • teacher on the right\n"
+            "⚙ Source teacher resolution and frame rate; encoding required.\n"
             "Existing /batch_watch is unchanged."
         )
         upload_limit = (4000 if getattr(getattr(bot, "me", None), "is_premium", False)
@@ -101,6 +101,7 @@ async def run_pip_batch(bot, source_client, message, start_link, count, *,
                     filename = os.path.splitext(filename)[0] + ".mp4"
                     os.makedirs("downloads", exist_ok=True)
                     with tempfile.TemporaryDirectory(prefix="pip_", dir="downloads") as directory:
+                        download_started = monotonic()
                         camera = await download_watch_board_video(
                             camera_url, os.path.join(directory, "camera.webm"),
                             abort_event=abort_event, max_size=upload_limit,
@@ -111,19 +112,21 @@ async def run_pip_batch(bot, source_client, message, start_link, count, *,
                             break
                         if not camera or not os.path.isfile(camera):
                             raise ValueError("Source download failed; no Telegram-camera fallback was sent")
+                        download_elapsed = monotonic() - download_started
                         started = monotonic()
 
                         async def render_progress(current, total):
                             try:
                                 await progress.edit(format_render_progress(current, total, monotonic()-started)
-                                                    + "\n🖼 Board-first • small teacher bottom-left")
+                                                    + "\n🖼 Board left • teacher right")
                             except Exception:
                                 pass
 
                         output = await render_board_video(
                             camera, events, os.path.join(directory, filename), abort_event,
-                            render_progress, max_size=upload_limit, layout="pip",
+                            render_progress, max_size=upload_limit, layout="fast_side_by_side",
                         )
+                        render_elapsed = monotonic() - started
                         if abort_event.is_set():
                             break
                         duration, _, _, width, height = await get_board_video_info(output)
@@ -142,10 +145,18 @@ async def run_pip_batch(bot, source_client, message, start_link, count, *,
                             kwargs["thumb"] = thumbnail
                         if abort_event.is_set():
                             break
+                        upload_started = monotonic()
                         sent = await bot.send_video(**kwargs)
                         if not sent:
                             raise ValueError("Telegram did not acknowledge the sent video")
                         processed += 1
+                        LOGGER(__name__).info(
+                            "Watch video post %s: download=%.2fs render=%.2fs upload=%.2fs "
+                            "duration=%ss size=%s bytes preset=%s",
+                            post.id, download_elapsed, render_elapsed, monotonic()-upload_started,
+                            duration, os.path.getsize(output),
+                            PyroConf.WATCH_BOARD_VIDEO_PRESET,
+                        )
                         LOGGER(__name__).info("Board-first post %s sent from URL assets, not Telegram media", post.id)
                 except (FloodWait, AuthKeyDuplicated, asyncio.CancelledError):
                     raise

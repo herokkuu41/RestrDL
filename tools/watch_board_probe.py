@@ -67,5 +67,5 @@ if __name__ == "__main__":
     parser.add_argument("--camera", help="Use an already verified local camera track for repeat rendering tests")
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--seconds", type=float, default=30)
-    parser.add_argument("--layout", choices=("side_by_side", "pip"), default="side_by_side")
+    parser.add_argument("--layout", choices=("side_by_side", "pip", "fast_side_by_side"), default="side_by_side")
     asyncio.run(run(parser.parse_args()))

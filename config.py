@@ -60,8 +60,11 @@ class PyroConf(object):
     WATCH_BOARD_CRF = int(getenv("WATCH_BOARD_CRF", "16"))
     WATCH_BOARD_PRESET = getenv("WATCH_BOARD_PRESET", "veryfast")
     WATCH_BOARD_NATIVE_SIZE = getenv("WATCH_BOARD_NATIVE_SIZE", "true").lower() in ("true", "1", "yes")
-    # Only the separate /batch_watch_video layout uses this lower output cadence.
+    # Previous footer cadence is retained only for diagnostic comparisons.
     WATCH_BOARD_PIP_FPS = int(getenv("WATCH_BOARD_PIP_FPS", "12"))
+    WATCH_BOARD_VIDEO_PRESET = getenv("WATCH_BOARD_VIDEO_PRESET", "superfast")
+    if WATCH_BOARD_VIDEO_PRESET not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        raise ValueError("Unsupported Watch Board video encoding preset")
     if not 1 <= WATCH_BOARD_PIP_FPS <= 30:
         raise ValueError("Watch Board PiP FPS must be 1..30")
     if WATCH_BOARD_PRESET not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):

@@ -437,6 +437,29 @@ def format_render_progress(current, total, elapsed):
     return text + "\nOriginal slide detail + timed handwriting + teacher."
 
 
+def board_yuv420(rgb, size):
+    """Convert a changed board once, instead of converting RGB every output frame.
+
+    Pillow produces full-range JPEG YCbCr. Map it explicitly to video range so
+    FFmpeg's yuv420p input preserves white backgrounds and black text correctly.
+    Chroma is subsampled as it is in the final Telegram-compatible H.264 output.
+    """
+    with Image.frombytes("RGB", size, rgb) as image:
+        with image.convert("YCbCr") as ycbcr:
+            channels = ycbcr.split()
+            try:
+                with channels[0].point([round(16 + value*219/255) for value in range(256)]) as y:
+                    result = y.tobytes()
+                for channel in channels[1:]:
+                    with channel.resize((size[0]//2, size[1]//2), Image.Resampling.BOX) as half:
+                        with half.point([round(16 + value*224/255) for value in range(256)]) as limited:
+                            result += limited.tobytes()
+                return result
+            finally:
+                for channel in channels:
+                    channel.close()
+
+
 async def render_board_video(camera_path, events, dest_path, abort_event=None, progress=None,
                              max_size=2000 * 1048576, *, clip_start=0, clip_duration=None,
                              layout="side_by_side"):
@@ -444,9 +467,9 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
 
     clip_* are for opt-in diagnostics only. Batch callers always render full length.
     Both layouts keep the teacher outside the board so it never covers text.
-    The default path is unchanged; only the new command requests the PiP footer.
+    The new command uses fast_side_by_side with separate speed settings.
     """
-    if layout not in ("side_by_side", "pip"):
+    if layout not in ("side_by_side", "pip", "fast_side_by_side"):
         raise ValueError("Unsupported Watch Board layout")
     async with _render_lock:
         started = monotonic()
@@ -460,11 +483,12 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         if duration <= 0 or clip_start < 0:
             raise ValueError("Invalid render duration")
         # Check the whole requested timeline before starting an expensive encode.
-        timeline_class = PlayerBoardTimeline if layout == "pip" else BoardTimeline
+        fast = layout == "fast_side_by_side"
+        timeline_class = PlayerBoardTimeline if layout != "side_by_side" else BoardTimeline
         await asyncio.to_thread(timeline_class(events).advance, clip_start + duration)
         board_w, height = PyroConf.WATCH_BOARD_WIDTH, PyroConf.WATCH_BOARD_HEIGHT
         encoded_slides = OrderedDict()
-        if PyroConf.WATCH_BOARD_NATIVE_SIZE:
+        if PyroConf.WATCH_BOARD_NATIVE_SIZE or fast:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
                 cache = SlideCache(session, encoded_slides)
                 try:
@@ -477,6 +501,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
             height = max(height, min(int(meta["size"][1]), PyroConf.WATCH_BOARD_HEIGHT))
             height += height % 2
         fps = PyroConf.WATCH_BOARD_FPS
+        preset, crf = PyroConf.WATCH_BOARD_PRESET, PyroConf.WATCH_BOARD_CRF
         teacher_w = min(int(meta["size"][0]), 640)
         teacher_w += teacher_w % 2
         # Preserve the camera track's frame rate. Board edits update at the
@@ -486,6 +511,18 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                  f"[1:v]scale={teacher_w}:{height}:force_original_aspect_ratio=decrease[c];"
                  f"[b][c]overlay=x={board_w}:y=(H-h)/2:shortest=1[v]")
         output_w, output_h = board_w + teacher_w, height
+        if fast:
+            # Preserve camera resolution and frame rate. Save encoder analysis
+            # work, not pixels or frames; CRF stays at the existing quality setting.
+            teacher_w = int(meta["size"][0])
+            teacher_w += teacher_w % 2
+            height = max(height, int(meta["size"][1]))
+            height += height % 2
+            output_w, output_h = board_w + teacher_w, height
+            preset = PyroConf.WATCH_BOARD_VIDEO_PRESET
+            graph = (f"[0:v]fps={camera_fps},pad={output_w}:{height}:0:0:black[b];"
+                     f"[1:v]scale={teacher_w}:{height}:force_original_aspect_ratio=decrease[c];"
+                     f"[b][c]overlay=x={board_w}:y=(H-h)/2:shortest=1[v]")
         if layout == "pip":
             # Main board remains pixel-for-pixel at the chosen resolution.
             # A reserved footer avoids obscuring notes with the small camera.
@@ -502,11 +539,11 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
                 "-filter_complex_threads", "1", "-threads", "1", "-thread_queue_size", "2",
                 "-probesize", "32", "-analyzeduration", "0", "-fpsprobesize", "0",
-                "-f", "rawvideo", "-pixel_format", "rgb24",
+                "-f", "rawvideo", "-pixel_format", "yuv420p" if fast else "rgb24",
                 "-video_size", f"{board_w}x{height}", "-framerate", str(fps), "-i", "pipe:0",
                 "-ss", str(clip_start), "-threads", "2", "-i", camera_path,
                 "-filter_complex", graph, "-map", "[v]", "-map", "1:a:0?", "-t", str(duration),
-                "-c:v", "libx264", "-preset", PyroConf.WATCH_BOARD_PRESET, "-crf", str(PyroConf.WATCH_BOARD_CRF),
+                "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
                 "-threads", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                 "-fs", str(max_size), "-movflags", "+faststart", temp_path]
         process = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE,
@@ -525,6 +562,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         error_task = asyncio.create_task(read_errors())
         reserve = PyroConf.DISK_RESERVE_MIB * 1048576
         timeline = timeline_class(events, (board_w, height))
+        frame_payload = None
         last_progress = -math.inf
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -533,7 +571,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                     for number in range(math.ceil(duration * fps)):
                         if abort_event and abort_event.is_set():
                             raise asyncio.CancelledError
-                        if number % fps == 0:
+                        if number % max(1, math.ceil(fps)) == 0:
                             if shutil.disk_usage(os.path.dirname(os.path.abspath(dest_path))).free < reserve:
                                 raise ValueError("Insufficient space for board export (256 MiB reserve)")
                             if os.path.exists(temp_path) and os.path.getsize(temp_path) >= max_size:
@@ -542,7 +580,9 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                         if timeline.dirty or timeline.frame is None:
                             source = await cache.get(timeline.slides[timeline.current].url)
                             await asyncio.to_thread(timeline.draw, source)
-                        process.stdin.write(timeline.frame)
+                            frame_payload = (await asyncio.to_thread(board_yuv420, timeline.frame, timeline.size)
+                                             if fast else timeline.frame)
+                        process.stdin.write(frame_payload)
                         await asyncio.wait_for(process.stdin.drain(), timeout=120)
                         if progress and monotonic() - last_progress >= 5:
                             await progress(number / fps, duration)
@@ -566,7 +606,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                                   "%.2fs elapsed, %.2fx realtime, preset=%s",
                                   output_w, output_h, duration, os.path.getsize(dest_path),
                                   sum((e.get("data") or {}).get("e") == "sc" for e in events),
-                                  elapsed, duration / max(elapsed, 0.001), PyroConf.WATCH_BOARD_PRESET)
+                                  elapsed, duration / max(elapsed, 0.001), preset)
             return dest_path
         except (BrokenPipeError, ConnectionResetError) as exc:
             await asyncio.wait_for(process.wait(), timeout=30)

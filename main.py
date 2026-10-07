@@ -568,7 +568,7 @@ async def help_command(_, message: Message):
         "   The bot downloads Watch Board videos directly and sends them.\n\n"
         "➤ **Board-first Video (New)**\n"
         "   – `/batch_watch_video` (or `/batch_watch_pip`), then link and count.\n"
-        "   – Full board + small teacher at bottom-left; encoding required.\n"
+        "   – Full board on the left + teacher on the right; encoding required.\n"
         "   – This is separate from the unchanged `/batch_watch` mode.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
@@ -919,7 +919,7 @@ async def batch_watch_video_command_start(bot: Client, message: Message):
     BATCH_STATES[user_id] = {'step': 'ask_link', 'mode': 'watch_pip'}
     await message.reply("🎞 **Board-first Video Mode**\n\n"
                         "Send the Telegram post link containing Watch Board & Face.\n"
-                        "Original board with a small teacher at bottom-left; encoding is required.")
+                        "Original board on the left, teacher on the right; encoding is required.")
 
 
 async def process_watch_video_batch(bot, message, start_link, count, abort_event=None):

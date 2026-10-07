@@ -246,7 +246,7 @@ If you prefer to run inside a Docker container:
   Export lessons linked through **Watch Board & Face**. Send the command without
   arguments for the guided link/count prompts. This is separate from `/batch`.
 - **`/batch_watch_video <Telegram start link> <count>`** (also `/batch_watch_pip`) –
-  New **board-first** export: original board with a small teacher at bottom-left.
+  Export the original board on the left and full-size teacher on the right.
   Supports the guided link/count prompts too; `/batch_watch` is unchanged.
 
 ### Faster board-first video mode (new command)
@@ -255,18 +255,22 @@ If you prefer to run inside a Docker container:
 player with the password from each source caption or media filename. It downloads
 the teacher from the URL (never Telegram's low-quality attachment), retrieves the
 original slides/timed handwriting, and exports one full-length MP4. The board
-uses native slide detail within the configured ceilings. The teacher is reduced
-to at most one quarter of the board width, in a bottom-left footer **outside**
-the board, so notes are never obscured. Captions/entities, source-title filenames,
+uses native slide detail within the configured ceilings. The teacher
+is shown in a separate column on the right at its source resolution and frame
+rate, so notes are never obscured. Captions/entities, source-title filenames,
 destination settings, counts, `/killall`, disk reserve, upload limits, and confirmed
 sends are supported. Wrong passwords, missing assets, and encoder failures do
 not send a camera-only replacement. FloodWait stops the batch without retry loops.
 
-Only this new layout caps output/teacher motion at **12 fps** by default; timed
-handwriting still updates at `WATCH_BOARD_FPS` (8 by default). Set
-`WATCH_BOARD_PIP_FPS=24` or `30` for smoother teacher motion at increased encoding
-cost (never above the source frame rate). Audio, full duration, and board spatial
-detail are retained. The new mode matches the web player's displayed ink: its
+Output keeps the camera's source frame rate, the original board resolution, the
+existing `WATCH_BOARD_CRF` quality setting (16 by default), and AAC 192 kbps audio.
+There is no new frame-rate cap, reduced teacher resolution, or raised CRF.
+`WATCH_BOARD_VIDEO_PRESET=superfast` reduces encoder analysis; compression is
+less efficient, so files can grow even at the same quality setting. Board frames
+are converted to video-range YUV420 only when the slide/ink changes, then reused.
+This halves board pipe traffic and avoids repeated RGB conversion in FFmpeg.
+Timed handwriting still updates at `WATCH_BOARD_FPS` (8 by default).
+Audio, full duration, and board spatial detail are retained. The new mode matches the web player's displayed ink: its
 published compiler ignores selected-object deletion (`dlos`) events, leaving
 those annotations visible. This compatibility behavior is isolated to the new
 mode. The existing `/batch_watch` keeps its own deletion handling, side-by-side layout
@@ -277,12 +281,16 @@ The browser exposed **one 640×360 teacher video plus a canvas**, not two video
 files or a separate premium-quality download. Combining the board into a standard
 Telegram video therefore still requires encoding; it cannot be an instant
 download of a pre-existing combined HD file. No guessed CDN variants or fake
-upscaling are used. On this desktop, the same real-source 120-second sample took
-**6.70s / 196.4 MiB peak / 4.11 MiB output** in the new 760×552 / 12-fps layout,
-versus **18.16s / 262.2 MiB / 14.51 MiB** in the existing 1400×428 layout. These
-are local diagnostic measurements, not a guarantee for the 1.5-core server or
-Telegram network throughput. Use the probe below with `--layout pip` to compare
-on the deployment host. It does not open a Telegram session.
+upscaling are used. A real-source 120-second sample at **1400×428 / 23.98 fps**
+took **11.55s / 245.7 MiB peak / 31.29 MiB output** with the new profile, versus
+**17.09s / 268.5 MiB / 17.35 MiB** with the standard side-by-side path on this
+desktop. The faster `ultrafast` experiment took 6.98s but produced 47.43 MiB;
+it was not selected by default because the larger upload can negate the saving.
+These measurements do not demonstrate an eight-minute end-to-end limit on the
+1.5-core server. Encoding, download/upload bandwidth, and CPU contention all
+affect that limit. Per-post logs now show download, render, and upload durations
+separately. Use `--layout fast_side_by_side` with the probe below on the deployment
+host for a representative measurement. It does not open a Telegram session.
 
 ### Watch Board & Face quality
 

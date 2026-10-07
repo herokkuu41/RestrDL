@@ -63,7 +63,7 @@ async def run(batch, count=1):
 async def test_pip_uses_password_url_and_own_layout_not_telegram_media(batch):
     await run(batch)
     assert pip.load_board_events.await_args.args[2] == "TEST"
-    assert pip.render_board_video.await_args.kwargs["layout"] == "pip"
+    assert pip.render_board_video.await_args.kwargs["layout"] == "fast_side_by_side"
     assert "clip_duration" not in pip.render_board_video.await_args.kwargs
     sent = batch.client.send_video.await_args.kwargs
     assert sent["chat_id"] == -100456 and sent["file_name"].endswith(".mp4")
@@ -236,6 +236,7 @@ async def test_wrapper_resolves_destination_and_cleans_active_state():
 @pytest.mark.parametrize("layout,limit,expected,fps", [
     ("pip", 12, (160, 128), 12), ("pip", 30, (160, 128), 24),
     ("side_by_side", 6, (320, 90), 24),
+    ("fast_side_by_side", 6, (320, 90), 24),
 ])
 @pytest.mark.asyncio
 async def test_real_encoder_layout_ink_audio_duration_and_default_unchanged(tmp_path, monkeypatch, layout, limit, expected, fps):
@@ -245,13 +246,18 @@ async def test_real_encoder_layout_ink_audio_duration_and_default_unchanged(tmp_
                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1.5",
                     "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p", "-c:a", "aac", camera], check=True)
     monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_PIP_FPS", limit)
+    if layout == "fast_side_by_side":
+        # The fast path must not inherit a deployment's expensive upscale flag.
+        monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_NATIVE_SIZE", False)
     data = io.BytesIO()
     Image.new("RGB", (160, 90), "white").save(data, format="JPEG")
     events = [event(0, e="sc", s={"u": "https://uadoc.uacdn.net/slide.jpg"}),
               event(0, e="cc", c="red"), ink(0, "d", x=0.2, y=0.5), ink(0.2, "u", x=0.8, y=0.5)]
     output = str(tmp_path / "result.mp4")
-    with patch.object(renderer.aiohttp.ClientSession, "get", return_value=response(data.getvalue())):
+    with patch.object(renderer.aiohttp.ClientSession, "get", return_value=response(data.getvalue())), \
+         patch.object(renderer, "board_yuv420", wraps=renderer.board_yuv420) as convert:
         await renderer.render_board_video(camera, events, output, layout=layout)
+    assert convert.call_count == (2 if layout == "fast_side_by_side" else 0)
     meta = renderer._media_metadata(output)
     assert meta["size"] == expected
     assert abs(meta["fps"] - fps) < 0.1
@@ -268,7 +274,8 @@ async def test_real_encoder_layout_ink_audio_duration_and_default_unchanged(tmp_
     assert min(frame.getpixel((80, 10))) > 235  # source board still unobscured
     red, green, blue = frame.getpixel((80, 45))
     assert red > 150 and green < 100 and blue < 100  # timed handwriting included
-    pixel = frame.getpixel((28, 109) if layout == "pip" else (240, 45))
+    location = (28, 109) if layout == "pip" else (240, 45)
+    pixel = frame.getpixel(location)
     assert pixel[1] > pixel[0] + 40 and pixel[1] > pixel[2] + 40
     if layout == "pip":
         assert max(frame.getpixel((100, 110))) < 20  # rest of footer, not stretched camera
@@ -281,3 +288,19 @@ async def test_invalid_layout_rejected_before_encoder():
         with pytest.raises(ValueError, match="layout"):
             await renderer.render_board_video("unused", [], "unused", layout="unknown")
     spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fast_layout_preserves_camera_above_old_640_pixel_limit(tmp_path, monkeypatch):
+    camera = str(tmp_path / "camera.mp4")
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "color=green:size=960x540:rate=25", "-t", "1",
+                    "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p", camera], check=True)
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_WIDTH", 640)
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_HEIGHT", 360)
+    output = str(tmp_path / "result.mp4")
+    await renderer.render_board_video(camera, [], output, layout="fast_side_by_side")
+    metadata = renderer._media_metadata(output)
+    assert metadata["size"] == (1600, 540)
+    assert metadata["fps"] == 25
+    assert abs(metadata["duration"] - 1) < 0.2
