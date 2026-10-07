@@ -124,6 +124,47 @@ async def test_slide_cache_retains_at_most_four_decoded_images():
 
 
 @pytest.mark.asyncio
+async def test_compressed_slide_cache_reuses_preflight_bytes_for_export():
+    from collections import OrderedDict
+    data = io.BytesIO()
+    Image.new("RGB", (760, 427), "white").save(data, format="JPEG")
+    payloads = OrderedDict()
+    session = MagicMock()
+    session.get.side_effect = lambda *_, **__: response(data.getvalue())
+    urls = [f"https://uadoc.uacdn.net/slide-{number}.jpg" for number in range(8)]
+    first = renderer.SlideCache(session, payloads)
+    for url in urls:
+        await first.get(url)
+    first.close()
+    assert len(payloads) == 8  # Compressed bytes, not decoded frames.
+    second_session = MagicMock()
+    second = renderer.SlideCache(second_session, payloads)
+    for url in reversed(urls):
+        assert (await second.get(url)).size == (760, 427)
+    assert len(second.cache) == 4
+    second_session.get.assert_not_called()
+    second.close()
+
+
+@pytest.mark.asyncio
+async def test_compressed_slide_cache_is_bounded_and_released(monkeypatch):
+    data = io.BytesIO()
+    Image.new("RGB", (32, 18), "white").save(data, format="JPEG")
+    limit = 3 * len(data.getvalue())
+    monkeypatch.setattr(renderer, "MAX_ENCODED_SLIDE_BYTES", limit)
+    session = MagicMock()
+    session.get.side_effect = lambda *_, **__: response(data.getvalue())
+    cache = renderer.SlideCache(session)
+    for number in range(10):
+        await cache.get(f"https://uadoc.uacdn.net/slide-{number}.jpg")
+        assert cache.encoded_bytes <= limit
+        assert sum(map(len, cache.encoded_cache.values())) <= limit
+    assert len(cache.encoded_cache) == 3
+    cache.close()
+    assert cache.encoded_bytes == 0 and not cache.encoded_cache and not cache.cache
+
+
+@pytest.mark.asyncio
 async def test_response_size_limit():
     with pytest.raises(ValueError, match="memory limit"):
         await renderer._bounded_body(response(b"abcd"), 3)
@@ -149,6 +190,116 @@ def test_microsecond_insertions_preserve_source_order():
     timeline = renderer.BoardTimeline(events)
     timeline.advance(2)
     assert timeline.current == "page1"
+
+
+def test_exact_microsecond_selection_is_not_delayed_by_float_roundtrip():
+    timestamp = 1_000_001
+    timeline = renderer.BoardTimeline([{"p_time": timestamp, "plugin": "dcn", "data": {"e": "sc", "s": 1}}])
+    timeline.advance(timestamp / 1_000_000)
+    assert timeline.current == "jump-1"
+
+
+@pytest.mark.asyncio
+async def test_native_size_uses_largest_visible_slide_not_entire_deck():
+    events = [event(0, e="as", i=1, uid="first", u="first"),
+              event(0, e="as", i=1, uid="second", u="second"),
+              event(0, e="as", i=1, uid="unused", u="unused"),
+              event(1.000001, e="sc", s=1), event(2, e="sc", s=2),
+              event(3, e="sc", s=1), event(100, e="sc", s=3)]
+    cache = MagicMock()
+    sizes = {"first": (760, 427), "second": (1000, 600)}
+    cache.get = AsyncMock(side_effect=lambda url: MagicMock(size=sizes[url]))
+    assert await renderer.native_board_size(events, 10, cache, (1920, 1080)) == (1000, 600)
+    assert [call.args[0] for call in cache.get.await_args_list] == ["first", "second"]
+
+
+@pytest.mark.parametrize("size,expected", [((760, 427), (760, 428)), ((1920, 1080), (640, 360))])
+@pytest.mark.asyncio
+async def test_native_size_rounds_even_and_respects_explicit_ceiling(size, expected):
+    cache = MagicMock(get=AsyncMock(return_value=MagicMock(size=size)))
+    maximum = (1920, 1080) if size == (760, 427) else (640, 360)
+    events = [event(0, e="sc", s={"u": "slide"})]
+    assert await renderer.native_board_size(events, 1, cache, maximum) == expected
+
+
+@pytest.mark.asyncio
+async def test_blank_board_uses_configured_size_without_image_requests():
+    cache = MagicMock(get=AsyncMock())
+    assert await renderer.native_board_size([event(0, e="sc", s=0)], 10, cache, (640, 360)) == (640, 360)
+    cache.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_slide_scan_has_four_request_limit_and_cancels_siblings():
+    events = [event(number, e="sc", s={"uid": str(number), "u": str(number)}) for number in range(9)]
+    active = peak = finished = 0
+    fail = False
+
+    async def get(url):
+        nonlocal active, peak, finished
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0)
+            if fail and url == "0":
+                raise ValueError("slide unavailable")
+            await asyncio.sleep(0.01)
+            return MagicMock(size=(760, 427))
+        finally:
+            active -= 1
+            finished += 1
+
+    cache = MagicMock(get=get)
+    assert await renderer.native_board_size(events, 10, cache, (1920, 1080)) == (760, 428)
+    assert peak == 4 and active == 0 and finished == 9
+    fail = True
+    finished = 0
+    with pytest.raises(ValueError, match="slide unavailable"):
+        await renderer.native_board_size(events, 10, cache, (1920, 1080))
+    assert active == 0 and finished == 4
+
+
+@pytest.mark.asyncio
+async def test_native_slide_scan_cancellation_awaits_all_downloads():
+    entered = asyncio.Event()
+    active = 0
+
+    async def get(_):
+        nonlocal active
+        active += 1
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+
+    events = [event(number, e="sc", s={"u": str(number)}) for number in range(4)]
+    task = asyncio.create_task(renderer.native_board_size(events, 10, MagicMock(get=get), (1920, 1080)))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_native_slide_scan_honors_batch_abort():
+    abort = asyncio.Event()
+    abort.set()
+    cache = MagicMock(get=AsyncMock())
+    with pytest.raises(asyncio.CancelledError):
+        await renderer.native_board_size([event(0, e="sc", s={"u": "slide"})], 1, cache, (1920, 1080), abort)
+    cache.get.assert_not_awaited()
+
+
+def test_render_progress_reports_elapsed_rate_and_estimate():
+    text = renderer.format_render_progress(120, 600, 20)
+    assert "20.0%" in text
+    assert "Elapsed: `20s`" in text
+    assert "`6.0×` realtime" in text
+    assert "Estimated remaining: `1m20s`" in text
+    assert "Preparing slides" in renderer.format_render_progress(0, 600, 0)
+    assert "Estimated remaining: `0s`" in renderer.format_render_progress(600, 600, 20)
 
 
 def test_selecting_future_blank_slot_retains_ink():
@@ -218,6 +369,40 @@ async def test_real_encoder_full_duration_dimensions_audio_and_ink(tmp_path, cam
     assert meta["audio_codec"].startswith("aac")
     assert abs(meta["fps"] - 12) < 0.1
     assert not list(tmp_path.glob("*.rendering.mp4"))
+
+
+@pytest.mark.parametrize("native,expected", [(True, (320, 90)), (False, (800, 360))])
+@pytest.mark.asyncio
+async def test_real_encoder_native_resolution_or_explicit_legacy_size(tmp_path, camera, monkeypatch, native, expected):
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_WIDTH", 640)
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_HEIGHT", 360)
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_NATIVE_SIZE", native)
+    monkeypatch.setattr(renderer.PyroConf, "WATCH_BOARD_PRESET", "veryfast")
+    events = [event(0, e="sc", s={"u": "https://uadoc.uacdn.net/slide.jpg"}),
+              event(0, e="cc", c="red"), ink(0, "d", x=0.2, y=0.5), ink(0.2, "u", x=0.8, y=0.5)]
+    data = io.BytesIO()
+    Image.new("RGB", (160, 90), "white").save(data, format="JPEG")
+    path = str(tmp_path / "native.mp4")
+    with patch.object(renderer.aiohttp.ClientSession, "get", return_value=response(data.getvalue())):
+        await renderer.render_board_video(camera, events, path)
+    meta = renderer._media_metadata(path)
+    assert meta["size"] == expected
+    assert abs(meta["duration"] - 1.5) < 0.2
+    reader = imageio_ffmpeg.read_frames(path, pix_fmt="rgb24")
+    try:
+        next(reader)
+        # Inspect after the stroke's 0.2s endpoint, not its first blank frame.
+        for _ in range(7):
+            pixels = next(reader)
+        frame = Image.frombytes("RGB", expected, pixels)
+    finally:
+        reader.close()
+    # Visible original slide, red ink, and separate green camera at both sizes.
+    board_width = expected[0] - 160
+    red, green, blue = frame.getpixel((board_width // 2, expected[1] // 2))
+    assert red > 150 and green < 100 and blue < 100
+    red, green, blue = frame.getpixel((board_width + 80, expected[1] // 2))
+    assert green > red + 40 and green > blue + 40
 
 
 @pytest.mark.asyncio

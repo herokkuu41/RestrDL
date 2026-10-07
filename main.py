@@ -2,7 +2,7 @@ import os
 import shutil
 import psutil
 import asyncio
-from time import time
+from time import time, monotonic
 from aiohttp import web
 
 from pyrogram.enums import ParseMode
@@ -34,6 +34,7 @@ from helpers.watch_board import (
 )
 from helpers.watch_board_render import (
     uses_board_player, extract_password, load_board_events, render_board_video, get_board_video_info,
+    format_render_progress,
 )
 
 from helpers.msg import (
@@ -1405,18 +1406,16 @@ async def process_watch_board_batch(
                         safe_filename = os.path.splitext(safe_filename)[0] + ".mp4"
                         output_path = os.path.join(dest_dir, safe_filename)
                         await progress_msg.edit(
-                            "🎨 **Rendering Board + Face**\n"
+                            "🎨 **Preparing fast Board + Face export**\n"
                             "Original slides + timed handwriting + teacher audio/video.\n"
-                            "This encoding stage can take several minutes; it is not a download."
+                            "Preparing slide assets and encoder…"
                         )
+                        render_started = monotonic()
 
                         async def render_progress(current, total):
                             try:
                                 await progress_msg.edit(
-                                    "🎨 **Rendering Board + Face**\n"
-                                    f"Timeline: `{get_readable_time(int(current))}` / "
-                                    f"`{get_readable_time(int(total))}` ({current / total * 100:.1f}%)\n"
-                                    "No camera-only fallback; board text is included."
+                                    format_render_progress(current, total, monotonic() - render_started)
                                 )
                             except Exception:
                                 pass

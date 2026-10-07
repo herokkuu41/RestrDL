@@ -58,6 +58,10 @@ class PyroConf(object):
     WATCH_BOARD_HEIGHT = int(getenv("WATCH_BOARD_HEIGHT", "1080"))
     WATCH_BOARD_FPS = int(getenv("WATCH_BOARD_FPS", "8"))
     WATCH_BOARD_CRF = int(getenv("WATCH_BOARD_CRF", "16"))
+    WATCH_BOARD_PRESET = getenv("WATCH_BOARD_PRESET", "veryfast")
+    WATCH_BOARD_NATIVE_SIZE = getenv("WATCH_BOARD_NATIVE_SIZE", "true").lower() in ("true", "1", "yes")
+    if WATCH_BOARD_PRESET not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        raise ValueError("Unsupported Watch Board encoding preset")
     if (not 640 <= WATCH_BOARD_WIDTH <= 1920 or not 360 <= WATCH_BOARD_HEIGHT <= 1080
             or WATCH_BOARD_WIDTH % 2 or WATCH_BOARD_HEIGHT % 2):
         raise ValueError("Watch Board dimensions must be even, within 640..1920 by 360..1080")

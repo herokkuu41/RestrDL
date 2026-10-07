@@ -257,28 +257,44 @@ media filename, authenticates normally with the player's cookie/request token,
 and combines the original slide images, timed vector handwriting, and teacher
 video/audio into a full-length MP4. The filename comes from the source title.
 
-Default board panel: **1920×1080**, separate camera column (up to 640 pixels wide),
-H.264 **CRF 16**, AAC audio 192 kbps. Teacher frame rate is retained; handwriting
-updates at 8 fps. The camera does not cover board text. This is a composed export,
+Default board panel: **native slide resolution**, up to **1920×1080**, with a
+separate camera column (up to 640 pixels wide), H.264 **CRF 16 / veryfast**, and
+AAC audio 192 kbps. Teacher frame rate is retained; handwriting updates at 8 fps.
+The camera does not cover board text. This is a composed export,
 not an untouched original HD recording: if the CDN camera is 640×360 or slides
 are 760×427, no extra photographic detail can be invented by enlarging them.
-Vector ink is rendered at the chosen board resolution. There is no verified
-higher-resolution camera variant at the supplied `output.webm` URL, so the bot
+Vector ink is rendered at the chosen board resolution. The bot checks the largest
+slide actually selected in the lesson, fetching dimensions with at most four
+concurrent requests. It does not download an entire imported deck or enlarge
+small slides simply to label the result "1080p". For 760×427 slides and a 640×360
+camera the composed output is 1400×428, retaining native slide/camera detail.
+There is no verified higher-resolution camera variant at the supplied
+`output.webm` URL, so the bot
 does not guess “1080p” URLs or silently use Telegram's source attachment.
 
 Board rendering takes CPU time and can be considerably slower than plain
 download/upload. It uses **one encoder globally**, two encoder threads, four
-cached slide images, and a bounded frame pipe—no Chromium or retained frame
+decoded slide images, a **32 MiB bounded compressed-slide cache** shared between
+preparation and rendering, and a bounded frame pipe—no Chromium or retained frame
 sequence. The camera file plus the finished MP4 need disk space. Both are cleaned
 up after delivery/failure; incomplete output is never sent. The 256 MiB disk
-reserve and destination upload limit are enforced. Authentication, missing slide,
+reserve and destination upload limit are enforced. Progress shows wall-clock
+elapsed time, render throughput (multiples of realtime), and an estimated remaining
+time, with edits limited to once every five seconds. Authentication, missing slide,
 unknown drawing-mode, and changed API errors fail explicitly without sending a
 camera-only replacement. Normal Telegram `/batch` concurrency is unchanged.
 
 Optional deployment overrides (defaults shown in `config.env.sample`):
 `WATCH_BOARD_WIDTH` (640–1920, even), `WATCH_BOARD_HEIGHT` (360–1080, even),
 `WATCH_BOARD_FPS` (1–15), and `WATCH_BOARD_CRF` (0–23; smaller means better
-quality/larger files). These do not control the resolution served by the CDN.
+quality/larger files). Width and height are **ceilings** when
+`WATCH_BOARD_NATIVE_SIZE=true` (default). Set it to `false` only if an enlarged
+canvas is needed; that is much more expensive and adds no photographic detail.
+`WATCH_BOARD_PRESET` defaults to `veryfast`; `superfast` or `ultrafast` can save
+more encoding CPU but produce substantially larger files, consuming more disk
+space and upload time. Supported slower overrides: `faster`, `fast`, `medium`.
+These settings do not control the resolution served by the CDN. Native sizing is
+on by default even on existing deployments; normal `/batch` transfers are unchanged.
 
 For opt-in live verification without opening a Telegram session, run
 `tools/watch_board_probe.py <player-url> --output <temporary-directory>` from a
@@ -287,10 +303,25 @@ and use test placeholders for `BOT_TOKEN` / `SESSION_STRING`. The probe exports
 a 30-second diagnostic clip by default; `--start` selects its timeline position
 and `--seconds` changes its length. **Batch exports always use full duration.**
 Live checks replayed all 17,141 events in the supplied two-hour lesson and
-visually verified short slide/handwriting clips. The 30-second 2560×1080 export
-peaked at about 688 MiB for Python plus FFmpeg locally. This is not a production
-server benchmark: Telegram delivery and a full-length encode on the 2 GB server
-still require deployment verification.
+visually verified slide/handwriting clips. On the same 120-second sample, the
+previous 2560×1080 export took **51.58s / 718.5 MiB peak**, versus native-size
+1400×428 at **14.56s / 267.2 MiB peak** (Python plus FFmpeg). A later sample with
+the shared compressed cache took **26.56s / 267.4 MiB peak** and produced a
+**byte-identical MP4 (matching SHA-256)**. End-to-end times include HTTP asset
+fetches and vary; these figures are observations, not a guaranteed multiplier.
+Both paths used CRF 16,
+the `veryfast` preset, the same local source, and the original teacher frame rate;
+timings include fetching selected slide dimensions/images. Output sizes were
+13.82 MB and 13.42 MB respectively. `superfast` took 13.27s but produced 24.84 MB,
+so it is not the default on a 2 GB disk. These are local export measurements,
+**not a guaranteed speed on the 1.5-core server**, and exclude Telegram delivery.
+The complete 7,322.14-second lesson was also exported at native size (1400×472,
+to preserve the tallest selected slide): **25m17s elapsed, 280.4 MiB peak RAM,
+893.27 MiB output**, with its full duration verified and late/tail frames decoded.
+That full-length test preceded adding the shared compressed cache; the cache's
+reuse, bounds, and identical short-sample output were verified separately.
+Combining moving video and a board into one playable MP4 still needs encoding;
+an unencoded offline-player bundle would be a different output format.
 
 > **Note:** Make sure that your user session account is a member of the source chat or channel before downloading.
 

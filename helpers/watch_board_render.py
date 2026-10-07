@@ -27,6 +27,7 @@ from logger import LOGGER
 PLAYER_HOST = "unacadamy-panel-api.vercel.app"
 MAX_EVENTS_BYTES = 32 * 1024 * 1024
 MAX_SLIDE_BYTES = 16 * 1024 * 1024
+MAX_ENCODED_SLIDE_BYTES = 32 * 1024 * 1024
 _render_lock = asyncio.Lock()  # One encoder globally on the 1.5-core server.
 
 
@@ -140,7 +141,7 @@ class BoardTimeline:
         return sid
 
     def advance(self, seconds):
-        target = seconds * 1_000_000
+        target = round(seconds * 1_000_000)
         while self.index < len(self.events) and self.events[self.index]["p_time"] <= target:
             event = self.events[self.index]
             self.index += 1
@@ -295,8 +296,11 @@ class BoardTimeline:
 
 
 class SlideCache:
-    def __init__(self, session):
+    def __init__(self, session, encoded_cache=None):
         self.session, self.cache = session, OrderedDict()
+        self.owns_encoded_cache = encoded_cache is None
+        self.encoded_cache = OrderedDict() if encoded_cache is None else encoded_cache
+        self.encoded_bytes = sum(len(data) for data in self.encoded_cache.values())
 
     async def get(self, url):
         if not url:
@@ -307,8 +311,16 @@ class SlideCache:
         if url in self.cache:
             self.cache.move_to_end(url)
             return self.cache[url]
-        async with self.session.get(url, allow_redirects=False) as response:
-            data = await _bounded_body(response, MAX_SLIDE_BYTES)
+        if url in self.encoded_cache:
+            self.encoded_cache.move_to_end(url)
+            data = self.encoded_cache[url]
+        else:
+            async with self.session.get(url, allow_redirects=False) as response:
+                data = await _bounded_body(response, MAX_SLIDE_BYTES)
+            self.encoded_cache[url] = data
+            self.encoded_bytes += len(data)
+            while self.encoded_bytes > MAX_ENCODED_SLIDE_BYTES:
+                self.encoded_bytes -= len(self.encoded_cache.popitem(last=False)[1])
         # uadoc's PDF?page=N URL serves a JPEG, not a complete PDF document.
         with Image.open(io.BytesIO(data)) as image:
             if image.width * image.height > 16_000_000:
@@ -324,6 +336,9 @@ class SlideCache:
         for image in self.cache.values():
             image.close()
         self.cache.clear()
+        if self.owns_encoded_cache:
+            self.encoded_cache.clear()
+            self.encoded_bytes = 0
 
 
 def _media_metadata(path):
@@ -347,6 +362,67 @@ async def get_board_video_info(path):
     return round(meta["duration"]), None, None, width, height
 
 
+async def native_board_size(events, end_time, cache, maximum, abort_event=None):
+    """Preserve the largest source slide, without inflating 760px images to 1920px."""
+    timeline = BoardTimeline(events)
+    seen = set()
+    urls = []
+    for event in events:
+        if event["p_time"] > end_time * 1_000_000:
+            break
+        if event.get("plugin") != "dcn" or (event.get("data") or {}).get("e") != "sc":
+            continue
+        if abort_event and abort_event.is_set():
+            raise asyncio.CancelledError
+        timeline.advance(event["p_time"] / 1_000_000)
+        url = timeline.slides[timeline.current].url
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    width = height = 0
+
+    async def dimensions(url):
+        image = await cache.get(url)
+        return image.size
+
+    # Four requests maximum; do not serially wait for dozens of slide fetches.
+    for offset in range(0, len(urls), 4):
+        if abort_event and abort_event.is_set():
+            raise asyncio.CancelledError
+        tasks = [asyncio.create_task(dimensions(url)) for url in urls[offset:offset+4]]
+        try:
+            for w, h in await asyncio.gather(*tasks):
+                width, height = max(width, w), max(height, h)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    if not width:
+        return maximum
+    width, height = min(width, maximum[0]), min(height, maximum[1])
+    return width + width % 2, height + height % 2
+
+
+def format_render_progress(current, total, elapsed):
+    """Actual render throughput, not a timeline counter mistaken for wall time."""
+    from helpers.files import get_readable_time
+    elapsed = max(0, elapsed)
+    percent = min(100, current / total * 100) if total > 0 else 0
+    text = ("🎨 **Exporting Board + Face**\n"
+            f"Timeline: `{get_readable_time(int(current))}` / "
+            f"`{get_readable_time(int(total))}` ({percent:.1f}%)\n"
+            f"⏱ Elapsed: `{get_readable_time(int(elapsed))}`")
+    if current > 0 and elapsed > 0:
+        rate = current / elapsed
+        eta = max(0, (total - current) / rate)
+        text += f" • `{rate:.1f}×` realtime\n⌛ Estimated remaining: `{get_readable_time(math.ceil(eta))}`"
+    else:
+        text += "\nPreparing slides; estimating export time…"
+    return text + "\nOriginal slide detail + timed handwriting + teacher."
+
+
 async def render_board_video(camera_path, events, dest_path, abort_event=None, progress=None,
                              max_size=2000 * 1048576, *, clip_start=0, clip_duration=None):
     """Stream a bounded number of raw board frames to FFmpeg; retain no frame files.
@@ -355,6 +431,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
     The teacher column is separate so it never covers any board text.
     """
     async with _render_lock:
+        started = monotonic()
         if abort_event and abort_event.is_set():
             raise asyncio.CancelledError
         import imageio_ffmpeg
@@ -367,6 +444,19 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         # Check the whole requested timeline before starting an expensive encode.
         await asyncio.to_thread(BoardTimeline(events).advance, clip_start + duration)
         board_w, height = PyroConf.WATCH_BOARD_WIDTH, PyroConf.WATCH_BOARD_HEIGHT
+        encoded_slides = OrderedDict()
+        if PyroConf.WATCH_BOARD_NATIVE_SIZE:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+                cache = SlideCache(session, encoded_slides)
+                try:
+                    board_w, height = await native_board_size(events, clip_start + duration, cache,
+                                                              (board_w, height), abort_event)
+                finally:
+                    cache.close()
+            # Do not shrink the original teacher track if slides are unusually
+            # small. The configured height remains the explicit ceiling.
+            height = max(height, min(int(meta["size"][1]), PyroConf.WATCH_BOARD_HEIGHT))
+            height += height % 2
         fps = PyroConf.WATCH_BOARD_FPS
         teacher_w = min(int(meta["size"][0]), 640)
         teacher_w += teacher_w % 2
@@ -384,7 +474,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                 "-video_size", f"{board_w}x{height}", "-framerate", str(fps), "-i", "pipe:0",
                 "-ss", str(clip_start), "-threads", "2", "-i", camera_path,
                 "-filter_complex", graph, "-map", "[v]", "-map", "1:a:0?", "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(PyroConf.WATCH_BOARD_CRF),
+                "-c:v", "libx264", "-preset", PyroConf.WATCH_BOARD_PRESET, "-crf", str(PyroConf.WATCH_BOARD_CRF),
                 "-threads", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                 "-fs", str(max_size), "-movflags", "+faststart", temp_path]
         process = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE,
@@ -406,7 +496,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
         last_progress = -math.inf
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-                cache = SlideCache(session)
+                cache = SlideCache(session, encoded_slides)
                 try:
                     for number in range(math.ceil(duration * fps)):
                         if abort_event and abort_event.is_set():
@@ -427,6 +517,7 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
                             last_progress = monotonic()
                 finally:
                     cache.close()
+                    encoded_slides.clear()
             process.stdin.close()
             await asyncio.wait_for(process.wait(), timeout=300)
             await error_task
@@ -438,9 +529,12 @@ async def render_board_video(camera_path, events, dest_path, abort_event=None, p
             if os.path.getsize(temp_path) > max_size:
                 raise ValueError("Board export exceeds Telegram's destination upload limit")
             os.replace(temp_path, dest_path)
-            LOGGER(__name__).info("Watch Board export: %sx%s, %.2fs, %s bytes, %s slide selections",
+            elapsed = monotonic() - started
+            LOGGER(__name__).info("Watch Board export: %sx%s, %.2fs, %s bytes, %s slide selections; "
+                                  "%.2fs elapsed, %.2fx realtime, preset=%s",
                                   board_w + teacher_w, height, duration, os.path.getsize(dest_path),
-                                  sum(e.get("data", {}).get("e") == "sc" for e in events))
+                                  sum((e.get("data") or {}).get("e") == "sc" for e in events),
+                                  elapsed, duration / max(elapsed, 0.001), PyroConf.WATCH_BOARD_PRESET)
             return dest_path
         except (BrokenPipeError, ConnectionResetError) as exc:
             await asyncio.wait_for(process.wait(), timeout=30)
