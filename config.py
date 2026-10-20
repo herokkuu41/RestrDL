@@ -57,6 +57,8 @@ class PyroConf(object):
     TRANSFER_TUNE_MIN_GAIN = float(getenv("TRANSFER_TUNE_MIN_GAIN", "0.10"))
     TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "4"))
     TRANSFER_WARM_TTL = float(getenv("TRANSFER_WARM_TTL", "600"))
+    TRANSFER_RPC_TIMEOUT = float(getenv("TRANSFER_RPC_TIMEOUT", "60"))
+    TRANSFER_FINALIZE_TIMEOUT = float(getenv("TRANSFER_FINALIZE_TIMEOUT", "120"))
     TRANSFER_CPU_TARGET = float(getenv("TRANSFER_CPU_TARGET", "85"))
     TRANSFER_MEMORY_TARGET = float(getenv("TRANSFER_MEMORY_TARGET", "80"))
     MIRROR_SOURCE_PINS = getenv("MIRROR_SOURCE_PINS", "true").lower() in ("true", "1", "yes")
@@ -109,6 +111,8 @@ class PyroConf(object):
     if not (0 < TRANSFER_WARM_TTL <= 3600 and 10 <= TRANSFER_CPU_TARGET <= 95
             and 10 <= TRANSFER_MEMORY_TARGET <= 95):
         raise ValueError("Invalid warm profile TTL or resource targets")
+    if not (0 < TRANSFER_RPC_TIMEOUT <= 300 and 0 < TRANSFER_FINALIZE_TIMEOUT <= 600):
+        raise ValueError("Transfer request timeouts must be positive and within 300/600 seconds")
     if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
         raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 

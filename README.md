@@ -60,6 +60,8 @@ The existing server-side copy/forward path remains the first choice when availab
 | `TRANSFER_TUNE_MIN_GAIN` | 0.10 | Minimum fractional ACK throughput improvement |
 | `TRANSFER_CRYPTO_WORKERS` | 4 | Native encryption/decryption executor workers |
 | `TRANSFER_WARM_TTL` | 600 | Seconds a confirmed upload window remains reusable for its route |
+| `TRANSFER_RPC_TIMEOUT` | 60 | Seconds to wait for one download chunk/upload part request |
+| `TRANSFER_FINALIZE_TIMEOUT` | 120 | Seconds to wait for Telegram media registration or final sending |
 | `TRANSFER_CPU_TARGET` | 85 | CPU percentage ceiling for growth, relative to the container quota |
 | `TRANSFER_MEMORY_TARGET` | 80 | Container memory percentage ceiling for growth |
 | `MIRROR_SOURCE_PINS` | true | Pin delivered copies of posts pinned in the source |
@@ -188,6 +190,17 @@ not isolated download-only or upload-only benchmarks. Telegram progress edits oc
 most every five seconds, and a slow edit no longer blocks other data workers.
 Progress clocks start when a file gets a transfer slot, excluding time queued behind
 earlier videos. Progress displays both recent interval speed and active-transfer average.
+
+Chunk/part requests explicitly use a 60-second response timeout instead of the library's
+15-second default. Each failed request is retried locally, up to three attempts, retaining
+the same offset, part number, upload handle, and payload. This is a per-request timeout,
+not a deadline for the whole video. After the bytes are acknowledged, Telegram media
+registration and final sending have a separate 120-second response timeout and bounded
+application retries with stable random IDs for deduplication. Library transport retries
+are disabled on these calls to avoid stacking hidden retry loops. Progress switches to
+waiting for Telegram to finish sending; delivery is counted only after its final response.
+Status-message cleanup is bounded and cannot turn successful delivery into a failure.
+Timeout logs identify the direction, RPC, offset/part, and configured deadline.
 
 The first successful **source-order** post is pinned as soon as all earlier candidates
 finish or fail; a later quick text post cannot take the pin from earlier media. Private

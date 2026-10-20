@@ -84,6 +84,42 @@ async def retry(operation):
             await asyncio.sleep((0.5, 1.0)[attempt])
 
 
+async def final_request(client, query):
+    """Retry the same upload handle/random IDs; never restart the byte pipeline."""
+    rpc = type(query).__name__
+    async def operation():
+        LOGGER(__name__).info("Telegram finalization: rpc=%s timeout=%ss", rpc, PyroConf.TRANSFER_FINALIZE_TIMEOUT)
+        try:
+            return await client.invoke(query, retries=0, timeout=PyroConf.TRANSFER_FINALIZE_TIMEOUT)
+        except TRANSIENT as error:
+            LOGGER(__name__).warning("Telegram finalization retry: rpc=%s reason=%s", rpc, type(error).__name__)
+            raise
+    try:
+        return await retry(operation)
+    except TimeoutError as error:
+        raise TimeoutError(f"Telegram {rpc} timed out after 3 attempts "
+                           f"({PyroConf.TRANSFER_FINALIZE_TIMEOUT:g}s per request)") from error
+
+
+async def delete_progress(message, timeout=5):
+    if message is not None:
+        try:
+            await asyncio.wait_for(message.delete(), timeout=timeout)
+        except Exception as error:
+            LOGGER(__name__).debug("Progress cleanup failed: %s", type(error).__name__)
+
+
+async def finalization_notice(message):
+    if message is not None:
+        try:
+            await asyncio.wait_for(message.edit(
+                "📤 **Upload complete**\nWaiting for Telegram to finish sending the media…\n"
+                "The uploaded data is retained while this request is retried.",
+                parse_mode=ParseMode.MARKDOWN), timeout=3)
+        except Exception as error:
+            LOGGER(__name__).debug("Finalization status edit failed: %s", type(error).__name__)
+
+
 async def startup_timeout(coro):
     # asyncio.wait_for on Python 3.10 can swallow a concurrent cancellation
     # when startup finishes at the same instant. Explicit supervision avoids it.
@@ -295,7 +331,7 @@ class TransferProgress:
             filled = int(fraction * 12)
             bar = "▰" * filled + "▱" * (12 - filled)
             text = (
-                f"⚡ **TRANSFER LIVE**\n{bar}  `{fraction:.0%}`\n\n"
+                f"⚡ **TRANSFER LIVE**\n{bar}  `{int(fraction * 100)}%`\n\n"
                 f"📥 **Download**\n"
                 f"Downloaded: {down / CHUNK_SIZE:.1f}/{size / CHUNK_SIZE:.1f} MiB\n"
                 f"Current speed: `{down_rate:.2f} MiB/s`\n"
@@ -365,7 +401,8 @@ class TransferManager:
                 async with window.lease():
                     if self.paused_until[direction] > time.monotonic():
                         continue
-                    result = await worker.session.invoke(query, sleep_threshold=0, retries=0)
+                    result = await worker.session.invoke(query, sleep_threshold=0, retries=0,
+                                                         timeout=PyroConf.TRANSFER_RPC_TIMEOUT)
                     amount = 0
                     if result is True and isinstance(query, (
                             raw.functions.upload.SaveFilePart, raw.functions.upload.SaveBigFilePart)):
@@ -382,6 +419,12 @@ class TransferManager:
                             "sample=%.2f MiB/s", identity & 0xffffffff, direction, change,
                             window.limit, window.confirmed, window.maximum, window.rate / CHUNK_SIZE)
                     return result
+            except TimeoutError:
+                LOGGER(__name__).warning(
+                    "Relay request timeout: direction=%s rpc=%s offset=%s part=%s timeout=%ss",
+                    direction, type(query).__name__, getattr(query, "offset", None),
+                    getattr(query, "file_part", None), PyroConf.TRANSFER_RPC_TIMEOUT)
+                raise
             except (FloodWait, FloodPremiumWait) as error:
                 attempts += 1
                 now = time.monotonic()
@@ -424,6 +467,9 @@ class TransferManager:
         self.download_window.pending += 1
         try:
             return await retry(operation)
+        except TimeoutError as error:
+            raise TimeoutError(f"Download chunk at byte {offset} timed out after 3 attempts "
+                               f"({PyroConf.TRANSFER_RPC_TIMEOUT:g}s per request)") from error
         finally:
             self.download_window.pending -= 1
 
@@ -442,6 +488,9 @@ class TransferManager:
         self.upload_window.pending += 1
         try:
             await retry(operation)
+        except TimeoutError as error:
+            raise TimeoutError(f"Upload part {part} timed out after 3 attempts "
+                               f"({PyroConf.TRANSFER_RPC_TIMEOUT:g}s per request)") from error
         finally:
             self.upload_window.pending -= 1
 
@@ -870,14 +919,14 @@ async def copy_album(client, chat_id, source_chat, message_id):
             random_id=client.rnd_id(), **await caption(client, message)))
     query = raw.functions.messages.SendMultiMedia(
         peer=await client.resolve_peer(chat_id), multi_media=items)
-    return await sent_messages(client, await retry(lambda: client.invoke(query)))
+    return await sent_messages(client, await final_request(client, query))
 
 
 async def finalize(bot, query, uploads, manager):
     async def operation():
         for attempt in range(3):
             try:
-                return await retry(lambda: bot.invoke(query))
+                return await final_request(bot, query)
             except FilePartMissing as error:
                 if attempt == 2:
                     raise
@@ -899,6 +948,7 @@ async def relay_media(source, bot, message, target, progress_message=None, abort
             peer=await bot.resolve_peer(target), media=media, random_id=bot.rnd_id(),
             **await caption(bot, message),
         )
+        await finalization_notice(progress_message)
         response = await finalize(bot, query, [upload], manager)
         return (await sent_messages(bot, response))[0]
     return await abortable(operation(), abort_event)
@@ -938,6 +988,7 @@ async def relay_album(source, bot, messages, target, progress_message=None, abor
                                                      message=item.message, entities=item.entities)
         else:
             query = raw.functions.messages.SendMultiMedia(peer=peer, multi_media=items)
-        response = await retry(lambda: bot.invoke(query))
+        await finalization_notice(progress_message)
+        response = await final_request(bot, query)
         return await sent_messages(bot, response)
     return await abortable(operation(), abort_event)

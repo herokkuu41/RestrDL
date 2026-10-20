@@ -41,7 +41,7 @@ from helpers.msg import (
     getChatMsgID,
     get_parsed_msg
 )
-from helpers.transfer import relay_media, close_transfers, copy_album
+from helpers.transfer import relay_media, close_transfers, copy_album, delete_progress
 from helpers.source_pins import source_messages, source_album, attach_source_pairs, mirror_source_pins
 from helpers.speedtest import run_speedtest, format_speedtest, format_speedtest_error
 from helpers.watch_board_pip import run_pip_batch
@@ -745,7 +745,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     raise RuntimeError("Transfer did not return a sent message")
                 
                 if progress_message:
-                    await progress_message.delete()
+                    await delete_progress(progress_message)
                     
                 return await delivered(chat_message, sent_msg, "bot", clone_errors=clone_errors)
 
@@ -846,7 +846,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     schedule_delete(progress_message)
                 else:
                     await reply_temporary(message, error_message)
-            LOGGER(__name__).error(e)
+            LOGGER(__name__).exception("Transfer failed for %s", post_url)
             return "error"
 
 
@@ -1751,13 +1751,15 @@ async def initialize():
     LOGGER(__name__).info(
         "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, "
         "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, crypto-workers=%s, "
-        "profile=%s, CPU-target=%s%%, memory-target=%s%%, mirror-source-pins=%s",
+        "profile=%s, CPU-target=%s%%, memory-target=%s%%, mirror-source-pins=%s, "
+        "rpc-timeout=%ss, finalize-timeout=%ss",
         PyroConf.PARALLEL_DOWNLOAD_WORKERS, PyroConf.PARALLEL_UPLOAD_WORKERS,
         PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION, PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
         PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB,
         PyroConf.TRANSFER_ADAPTIVE, PyroConf.MAX_UPLOAD_REQUESTS_PER_CONNECTION,
         PyroConf.TRANSFER_CRYPTO_WORKERS, PyroConf.TRANSFER_PROFILE,
-        PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET, PyroConf.MIRROR_SOURCE_PINS)
+        PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET, PyroConf.MIRROR_SOURCE_PINS,
+        PyroConf.TRANSFER_RPC_TIMEOUT, PyroConf.TRANSFER_FINALIZE_TIMEOUT)
 
 
 # -------------------------------------------------------------------------------------

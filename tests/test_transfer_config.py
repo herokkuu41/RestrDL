@@ -32,6 +32,8 @@ def test_environment_overrides_reach_production_request_pools(tmp_path):
     {"MAX_UPLOAD_REQUESTS_PER_CONNECTION": "4"},
     {"TRANSFER_TUNE_INTERVAL": "nan"},
     {"UPLOAD_REQUESTS_PER_CONNECTION": "0"},
+    {"TRANSFER_RPC_TIMEOUT": "0"},
+    {"TRANSFER_FINALIZE_TIMEOUT": "nan"},
 ])
 def test_invalid_transfer_settings_fail_before_sessions_open(tmp_path, settings):
     result = load_config(tmp_path, **settings)

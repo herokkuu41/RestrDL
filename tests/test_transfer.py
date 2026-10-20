@@ -400,7 +400,7 @@ async def test_album_order_metadata_and_parallel_preparation(monkeypatch):
         return Upload(source, msg, "video", CHUNK_SIZE, f"{msg.id}.mp4", "video/mp4",
                       raw.types.InputFile(id=msg.id, parts=2, name=f"{msg.id}.mp4", md5_checksum="x"))
     monkeypatch.setattr(manager, "prepare", prepare)
-    async def invoke(query):
+    async def invoke(query, **kwargs):
         if isinstance(query, raw.functions.messages.UploadMedia):
             assert query.media.attributes[1].w == 640
             return NS(document=NS(id=query.media.file.id, access_hash=99, file_reference=b"ref"))
@@ -779,7 +779,7 @@ async def test_album_copy_uses_existing_ids_and_topics_safe_parser(monkeypatch):
         assert response.topics == []
         return [NS(id=sent.id) for sent in response.messages]
     monkeypatch.setattr(transfer.utils, "parse_messages", parse)
-    async def invoke(query):
+    async def invoke(query, **kwargs):
         assert [item.media.id.id for item in query.multi_media] == [1, 2, 3]
         assert all(item.message == "caption" for item in query.multi_media)
         updates = [raw.types.UpdateNewMessage(message=raw.types.MessageEmpty(id=i), pts=1, pts_count=1)

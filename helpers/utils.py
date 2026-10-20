@@ -23,7 +23,7 @@ from helpers.files import (
 
 from helpers.msg import get_parsed_msg
 from helpers.fast_download import fast_download
-from helpers.transfer import relay_album
+from helpers.transfer import relay_album, delete_progress
 from logger import LOGGER
 
 
@@ -475,7 +475,4 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
                                  progress_message=progress_message, abort_event=abort_event)
         return attach_source_pairs(media_group_messages, sent)
     finally:
-        try:
-            await progress_message.delete()
-        except Exception:
-            pass
+        await delete_progress(progress_message)
