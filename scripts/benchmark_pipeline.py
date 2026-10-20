@@ -17,8 +17,8 @@ from helpers.transfer import CHUNK_SIZE, PART_SIZE, TransferManager
 
 
 class SimulatedTransfer(TransferManager):
-    def __init__(self, download_requests, upload_requests, latency):
-        super().__init__(downloads=4, uploads=4, active=1, buffer_mib=64,
+    def __init__(self, download_requests, upload_requests, latency, connections=4):
+        super().__init__(downloads=connections, uploads=connections, active=1, buffer_mib=128,
                          download_requests=download_requests, upload_requests=upload_requests,
                          adaptive=False)
         self.read_slots = asyncio.Semaphore(self.downloads.capacity)
@@ -48,20 +48,25 @@ class SimulatedTransfer(TransferManager):
 
 async def benchmark(args):
     size = args.mib * CHUNK_SIZE + 17
-    for mode, down, up in (("one-request", 1, 1), ("pipelined", 2, 4)):
-        for repeat in range(args.repeats):
-            manager = SimulatedTransfer(down, up, args.latency_ms / 1000)
-            bot = SimpleNamespace(rnd_id=lambda: 12345)
-            message = SimpleNamespace(id=1, chat=SimpleNamespace(id=1))
-            started = time.perf_counter()
-            cpu_started = time.process_time()
-            try:
+    for mode, connections, down, up in (("one-request", 4, 1, 1), ("pipelined", 4, 2, 4),
+                                       ("throughput", 8, 4, 4)):
+        manager = SimulatedTransfer(down, up, args.latency_ms / 1000, connections)
+        try:
+            for repeat in range(args.repeats):
+                manager.parts.clear()
+                manager.acked, manager.first_ack = 0, None
+                bot = SimpleNamespace(rnd_id=lambda: 12345)
+                message = SimpleNamespace(id=1, chat=SimpleNamespace(id=1))
+                started = time.perf_counter()
+                cpu_started = time.process_time()
                 await manager.pipe(None, bot, message, None, size, "synthetic.bin", None)
                 elapsed = time.perf_counter() - started
-                if manager.acked != size or len(manager.parts) != math.ceil(size / PART_SIZE):
+                if (manager.acked != size or len(manager.parts) != math.ceil(size / PART_SIZE)
+                        or manager.budget.used or manager.upload_users):
                     raise ValueError("Incomplete synthetic upload")
                 print(json.dumps({
                     "mode": mode, "repeat": repeat + 1, "bytes": size,
+                    "connections_per_direction": connections,
                     "seconds": round(elapsed, 4),
                     "ack_MiB_per_second": round(size / CHUNK_SIZE / elapsed, 3),
                     "first_ack_seconds": round(manager.first_ack - started, 4),
@@ -70,8 +75,8 @@ async def benchmark(args):
                     "download_RPC_limit": manager.downloads.capacity,
                     "upload_RPC_limit": manager.uploads.capacity,
                 }))
-            finally:
-                await manager.close()
+        finally:
+            await manager.close()
 
 
 if __name__ == "__main__":

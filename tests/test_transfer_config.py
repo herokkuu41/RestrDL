@@ -37,3 +37,18 @@ def test_invalid_transfer_settings_fail_before_sessions_open(tmp_path, settings)
     result = load_config(tmp_path, **settings)
     assert result.returncode != 0
     assert "ValueError" in result.stderr
+
+
+@pytest.mark.parametrize("profile,expected", [("throughput", "8 8 4 128"), ("balanced", "4 4 2 64")])
+def test_profile_defaults_without_legacy_overrides(tmp_path, profile, expected):
+    env = {**os.environ, "BOT_TOKEN": "123456:TEST", "SESSION_STRING": "offline",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "TRANSFER_PROFILE": profile}
+    for key in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
+                "DOWNLOAD_REQUESTS_PER_CONNECTION", "TRANSFER_BUFFER_MIB"):
+        env.pop(key, None)
+    result = subprocess.run([sys.executable, "-B", "-c",
+        "from config import PyroConf as c; print(c.PARALLEL_DOWNLOAD_WORKERS, "
+        "c.PARALLEL_UPLOAD_WORKERS, c.DOWNLOAD_REQUESTS_PER_CONNECTION, c.TRANSFER_BUFFER_MIB)"],
+        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected

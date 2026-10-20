@@ -132,7 +132,7 @@ async def test_stream_integrity_checksums_and_boundaries(monkeypatch, size):
 
 async def test_upload_starts_before_download_finishes(monkeypatch):
     backend = Backend(monkeypatch)
-    size = 24*CHUNK_SIZE
+    size = 96*CHUNK_SIZE
     backend.size[1] = size
     source, bot = clients()
     manager = TransferManager()
@@ -836,7 +836,7 @@ async def test_repeated_short_throttles_are_bounded_and_reduce_windows(monkeypat
         await manager.invoke(worker, raw.functions.help.GetConfig(), "upload")
     assert worker.session.invoke.await_count == 3
     assert len(pauses) == 2
-    assert control.limit == control.confirmed == 2
+    assert control.limit == control.confirmed == 8  # one recovery episode, not three cuts
     await manager.close()
 
 
@@ -948,6 +948,110 @@ async def test_throttled_parts_retry_through_the_reduced_window():
     results = await asyncio.wait_for(transfer.supervised([
         manager.invoke(worker, query, "upload") for query in queries]), 3)
     assert results == [True] * 4
-    assert peak == manager.upload_window.limit == 1
+    assert peak == manager.upload_window.limit == 2  # one throttle event, one reduction
     assert manager.upload_window.active == manager.upload_window.waiting == 0
     assert list(attempts.values()) == [2] * 4
+
+
+async def test_source_throttle_does_not_ratchet_down_upload_capacity(monkeypatch):
+    manager = TransferManager()
+    initial = manager.upload_window.limit
+    source_initial = manager.download_window.limit
+    worker = NS(session=NS(invoke=AsyncMock(side_effect=[FloodPremiumWait(1), True])))
+    async def sleep(seconds):
+        manager.paused_until["download"] = 0
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    assert await manager.invoke(worker, raw.functions.help.GetConfig(), "download") is True
+    assert manager.upload_window.limit == initial
+    assert manager.download_window.limit == source_initial // 2
+
+
+async def test_consecutive_files_reuse_confirmed_window_until_profile_expires(monkeypatch):
+    backend = Backend(monkeypatch)
+    source, bot = clients()
+    manager = TransferManager(downloads=4, uploads=4, upload_requests=1, adaptive=True)
+    monkeypatch.setattr(manager.resources, "has_headroom", lambda: True)
+    starts = []
+    fetch = manager.fetch
+    async def record(source, fid, offset, expected):
+        if offset == 0:
+            starts.append(manager.upload_window.limit)
+            if fid.media_id == 1:
+                manager.upload_window.limit = manager.upload_window.confirmed = 8
+                manager.upload_window.confirmed_rate = 125
+        return await fetch(source, fid, offset, expected)
+    monkeypatch.setattr(manager, "fetch", record)
+    try:
+        for i in (1, 2, 3):
+            backend.size[i] = 12 * CHUNK_SIZE
+            await manager.prepare(source, bot, message(backend.size[i], i))
+            if i == 2:
+                key = next(iter(manager.profiles))
+                manager.profiles[key] = (8, 0)  # expired before the third object
+        assert starts == [4, 8, 4]
+        assert manager.budget.used == manager.upload_window.pending == 0
+    finally:
+        await manager.close()
+
+
+async def test_queued_progress_starts_when_transfer_slot_is_admitted(monkeypatch):
+    backend = Backend(monkeypatch)
+    backend.gate = asyncio.Event()
+    backend.size[1] = backend.size[2] = 12 * CHUNK_SIZE
+    source, bot = clients()
+    manager = TransferManager(active=1)
+    first, second = transfer.TransferProgress(), transfer.TransferProgress()
+    one = asyncio.create_task(manager.prepare(source, bot, message(backend.size[1], 1), first))
+    two = asyncio.create_task(manager.prepare(source, bot, message(backend.size[2], 2), second))
+    try:
+        await asyncio.sleep(0.05)
+        assert first.started is not None and second.started is None
+        backend.gate.set()
+        await asyncio.wait_for(asyncio.gather(one, two), 3)
+        assert second.started > first.started
+    finally:
+        one.cancel()
+        two.cancel()
+        await asyncio.gather(one, two, return_exceptions=True)
+        await manager.close()
+
+
+async def test_failed_file_invalidates_its_warm_profile_and_releases_bytes(monkeypatch):
+    backend = Backend(monkeypatch)
+    backend.size[1] = 12 * CHUNK_SIZE
+    source, bot = clients()
+    manager = TransferManager(downloads=4, uploads=4, upload_requests=1, adaptive=True)
+    monkeypatch.setattr(manager.resources, "has_headroom", lambda: True)
+    fetch = manager.fetch
+    async def confirm(source, fid, offset, expected):
+        manager.upload_window.confirmed = manager.upload_window.limit = 8
+        manager.upload_window.confirmed_rate = 125
+        return await fetch(source, fid, offset, expected)
+    monkeypatch.setattr(manager, "fetch", confirm)
+    try:
+        await manager.prepare(source, bot, message(backend.size[1]))
+        assert manager.profiles
+        backend.false_ack = True
+        async def once(operation):
+            return await operation()
+        monkeypatch.setattr(transfer, "retry", once)
+        with pytest.raises(OSError):
+            await manager.prepare(source, bot, message(backend.size[1]))
+        assert not manager.profiles
+        assert manager.budget.used == manager.upload_window.pending == manager.download_window.pending == 0
+    finally:
+        await manager.close()
+
+
+async def test_throttle_responses_spaced_across_waits_do_not_repeatedly_cut_capacity(monkeypatch):
+    manager = TransferManager()
+    manager.upload_window = transfer.UploadWindow(16, 32, 4)
+    clock = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: clock[0])
+    async def sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    worker = NS(session=NS(invoke=AsyncMock(side_effect=[FloodPremiumWait(1), FloodPremiumWait(1), True])))
+    assert await manager.invoke(worker, raw.functions.help.GetConfig(), "upload") is True
+    assert clock[0] == 1002
+    assert manager.upload_window.limit == 8

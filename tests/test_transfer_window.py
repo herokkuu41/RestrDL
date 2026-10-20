@@ -117,6 +117,7 @@ def test_idle_reset_discards_learned_window_but_keeps_recent_throttle():
     control.reset()
     assert control.limit == control.confirmed == 2
     control.next_trial = 0
+    control.recovery_until = 0
     control.reset()
     assert control.limit == control.confirmed == 4
 
@@ -128,3 +129,28 @@ def test_ack_sampling_recognizes_backlog_while_a_batch_of_rpcs_drains():
     control.acknowledge(1000, now=5)
     assert control.acknowledge(1000, now=10) == "trial"
     assert control.limit == 8
+
+
+def test_warm_window_survives_an_unhelpful_trial_and_new_file():
+    control = window()
+    control.confirmed = 8
+    control.limit = 12
+    control.trial = True
+    control.rollback(10, "source-starved")
+    control.reset(warm=8)
+    assert control.limit == control.confirmed == 8
+    assert not control.samples and not control.trial
+
+
+def test_resource_pressure_blocks_growth_and_reduces_work():
+    control = UploadWindow(4, 12, 4, headroom=lambda: False)
+    assert control.sample(1000, True, 5) == "resource-pressure"
+    assert control.limit < 4 and not control.trial
+
+
+def test_fixed_mode_does_not_start_trials_after_throttle():
+    control = UploadWindow(4, 12, 4, adaptive=False)
+    control.backoff()
+    for now in (50, 55, 60, 65):
+        assert control.sample(1000, True, now) is None
+    assert control.limit == 2

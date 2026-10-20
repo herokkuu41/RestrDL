@@ -42,6 +42,7 @@ from helpers.msg import (
     get_parsed_msg
 )
 from helpers.transfer import relay_media, close_transfers, copy_album
+from helpers.source_pins import source_messages, source_album, attach_source_pairs, mirror_source_pins
 from helpers.speedtest import run_speedtest, format_speedtest, format_speedtest_error
 from helpers.watch_board_pip import run_pip_batch
 
@@ -104,10 +105,12 @@ def new_pin_decision() -> dict:
 
 
 def build_pin_prompt_text(seconds_left: int) -> str:
+    source_note = "Source-pinned posts are mirrored independently of this choice.\n\n" if PyroConf.MIRROR_SOURCE_PINS else ""
     return (
         "📌 **Pin the first post of this batch?**\n\n"
         "Say **Yes** and I will pin the **first post** of this batch to the top of the "
         "destination chat as soon as it is uploaded.\n\n"
+        f"{source_note}"
         f"⏳ No answer in **{seconds_left}s** → the batch continues **without pinning**.\n"
         "Tap a button below, or simply reply `yes` / `no`."
     )
@@ -116,11 +119,14 @@ def build_pin_prompt_text(seconds_left: int) -> str:
 def build_pin_status_text(pin_first: bool) -> str:
     if pin_first:
         return "✅ **Pin enabled** — I will pin the first post of this batch."
-    return "➡️ **No pinning** for this batch."
+    return ("➡️ **Extra first-post pin disabled.** Source pins will still be mirrored."
+            if PyroConf.MIRROR_SOURCE_PINS else "➡️ **No pinning** for this batch.")
 
 
 def pin_answer_alert(pin_first: bool) -> str:
-    return "Pin enabled for this batch." if pin_first else "No pinning for this batch."
+    return "Pin enabled for this batch." if pin_first else (
+        "Extra first-post pin disabled. Source pins remain enabled."
+        if PyroConf.MIRROR_SOURCE_PINS else "No pinning for this batch.")
 
 
 def pin_target(decision: dict):
@@ -159,6 +165,10 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
     primary_client, primary_chat_id = pin_target(decision)
     if not msg_id or primary_chat_id is None or primary_client is None:
         return False
+    if decision.get("source_mirrored"):
+        decision["pinned"] = True
+        decision["pinned_in"] = (primary_client, primary_chat_id, msg_id)
+        return True
 
     is_private = bool(decision.get("private"))
     LOGGER(__name__).info(f"Pinning first batch post: primary_chat={primary_chat_id} message={msg_id}")
@@ -248,6 +258,8 @@ async def unpin_first_post(decision: dict, notify=None) -> bool:
     """Undo the pin when the user changes their mind while the batch is running."""
     if not decision.get("pinned"):
         return False
+    if decision.get("source_mirrored"):
+        return False  # The first-post preference does not remove a mirrored source pin.
     client, chat_id, msg_id = decision.get("pinned_in") or (
         decision.get("bot"), decision.get("chat_id"), decision.get("first_msg_id"))
     try:
@@ -420,7 +432,7 @@ async def get_album_ids(chat_id, message_id):
 
 
 async def try_clone(bot: Client, chat_message, chat_id, message_id,
-                    target_chat_id, user_target_chat_id):
+                    target_chat_id, user_target_chat_id, cache=None):
     """Clone a post without downloading it -> (sent_msg, strategy, sender, errors).
 
     Forwarding with drop_author=True is tried first: Telegram copies the post
@@ -430,10 +442,20 @@ async def try_clone(bot: Client, chat_message, chat_id, message_id,
     """
     if getattr(chat_message, "has_protected_content", False):
         return None, None, None, [PROTECTED_REASON]
+    if cache is not None and cache.get("protected_source") == chat_id:
+        return None, None, None, [PROTECTED_REASON]
 
     errors = []
     is_group = bool(chat_message.media_group_id)
-    ids = await get_album_ids(chat_id, message_id) if is_group else [message_id]
+    sources = [chat_message]
+    if is_group:
+        try:
+            sources = await source_album(user, chat_id, message_id)
+        except (FloodWait, AuthKeyDuplicated):
+            raise
+        except Exception as error:
+            LOGGER(__name__).info("Could not read source album %s: %s", message_id, error)
+    ids = [m.id for m in sources]
 
     plan = (
         ("user-forward", "user", user_target_chat_id),
@@ -454,7 +476,7 @@ async def try_clone(bot: Client, chat_message, chat_id, message_id,
                     chat_id=dest, from_chat_id=chat_id, message_id=message_id)
 
             if isinstance(sent, list):
-                sent = sent[0] if sent else None
+                sent = attach_source_pairs(sources, sent)
             if sent:
                 LOGGER(__name__).info(f"Cloned {ids} via {name}")
                 return sent, name, sender, errors
@@ -468,6 +490,10 @@ async def try_clone(bot: Client, chat_message, chat_id, message_id,
                 raise AuthKeyDuplicated(e)
             LOGGER(__name__).info(f"{name} failed for {ids}: {e}")
             errors.append(f"{name}: {e}")
+            if "CHAT_FORWARDS_RESTRICTED" in str(e).upper():
+                if cache is not None:
+                    cache["protected_source"] = chat_id
+                break
 
     return None, None, None, errors
 
@@ -660,28 +686,30 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
         user_target_chat_id = await resolve_user_target_chat_id(bot, message)
         progress_message = None
 
+        async def delivered(source, sent, sender, **extra):
+            mirrored = await mirror_source_pins(bot, user, source, sent, sender,
+                target_chat_id, user_target_chat_id,
+                notify=lambda text: reply_temporary(message, text))
+            return {"status": "success", "sent_msg": sent, "sent_msg_id": sent.id,
+                    "sent_by": sender, "source_pin_first": sent.id in mirrored,
+                    "source_pin_count": len(mirrored), **extra}
+
         try:
             chat_id, message_id, thread_id = getChatMsgID(post_url)
             
             if pre_fetched_msg:
                 chat_message = pre_fetched_msg
             else:
-                chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+                chat_message = await source_messages(user, chat_id, message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
             sent_msg, clone_strategy, clone_sender, clone_errors = await try_clone(
                 bot, chat_message, chat_id, message_id,
-                target_chat_id, user_target_chat_id
+                target_chat_id, user_target_chat_id, cache=clone_notice
             )
             if sent_msg:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                return {
-                    "status": "success",
-                    "sent_msg": sent_msg,
-                    "sent_msg_id": getattr(sent_msg, "id", None),
-                    "sent_by": clone_sender,
-                    "cloned": True,
-                }
+                return await delivered(chat_message, sent_msg, clone_sender, cloned=True)
             LOGGER(__name__).info(f"Clone unavailable for {post_url}: {clone_errors}")
             await announce_clone_fallback(message, clone_errors, clone_notice)
 
@@ -705,13 +733,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     if not silent:
                         await reply_temporary(message, "**Could not extract any valid media from the media group.**")
                     return "error"
-                return {
-                    "status": "success",
-                    "sent_msg": sent_msg,
-                    "sent_msg_id": getattr(sent_msg, "id", None),
-                    "sent_by": "bot",
-                    "clone_errors": clone_errors,
-                }
+                return await delivered(chat_message, sent_msg, "bot", clone_errors=clone_errors)
 
             elif chat_message.media:
                 if not silent:
@@ -725,23 +747,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if progress_message:
                     await progress_message.delete()
                     
-                return {
-                    "status": "success",
-                    "sent_msg": sent_msg,
-                    "sent_msg_id": getattr(sent_msg, "id", None),
-                    "sent_by": "bot",
-                    "clone_errors": clone_errors,
-                }
+                return await delivered(chat_message, sent_msg, "bot", clone_errors=clone_errors)
 
             elif chat_message.text or chat_message.caption:
                 sent_msg = await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                return {
-                    "status": "success",
-                    "sent_msg": sent_msg,
-                    "sent_msg_id": sent_msg.id,
-                    "sent_by": "bot",
-                    "clone_errors": clone_errors,
-                }
+                return await delivered(chat_message, sent_msg, "bot", clone_errors=clone_errors)
             else:
                 if not silent:
                     await reply_temporary(message, "**No media or text found in the post URL.**")
@@ -1101,6 +1111,9 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
     async def record_and_pin_first(source_id, res):
         """Later fast text posts cannot steal the pin from earlier media."""
+        if isinstance(res, dict):
+            pin_decision["source_pin_count"] = (pin_decision.get("source_pin_count", 0)
+                                               + res.get("source_pin_count", 0))
         if pin_decision.get("first_msg_id") or abort_event.is_set():
             return
         ordered_results[source_id] = res
@@ -1112,6 +1125,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 pin_decision["first_msg_id"] = res["sent_msg_id"]
                 pin_decision["first_msg"] = res.get("sent_msg")
                 pin_decision["first_sender"] = res.get("sent_by") or "bot"
+                pin_decision["source_mirrored"] = res.get("source_pin_first", False)
                 ordered_results.clear()
                 if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
                         and not pin_decision.get("pin_failed"):
@@ -1150,7 +1164,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
         try:
             # OPTIMIZATION: Fetch in bulk to save API rate limits!
-            messages_batch = await user.get_messages(chat_id=start_chat, message_ids=chunk)
+            messages_batch = await source_messages(user, start_chat, chunk)
         except FloodWait as e:
             await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
             abort_event.set()
@@ -1269,7 +1283,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             message.from_user.id,
             "📌 Pin prompt closed — the first post of this batch is pinned."
             if pin_decision.get("pinned")
-            else "⌛ Pin prompt closed — nothing was pinned.",
+            else (f"📌 Source pins mirrored: {pin_decision['source_pin_count']}. Extra first-post pin disabled."
+                  if pin_decision.get("source_pin_count") else "⌛ Pin prompt closed — nothing was pinned."),
             expect=pin_prompt
         )
 
@@ -1735,12 +1750,14 @@ async def initialize():
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
     LOGGER(__name__).info(
         "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, "
-        "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, crypto-workers=%s",
+        "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, crypto-workers=%s, "
+        "profile=%s, CPU-target=%s%%, memory-target=%s%%, mirror-source-pins=%s",
         PyroConf.PARALLEL_DOWNLOAD_WORKERS, PyroConf.PARALLEL_UPLOAD_WORKERS,
         PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION, PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
         PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB,
         PyroConf.TRANSFER_ADAPTIVE, PyroConf.MAX_UPLOAD_REQUESTS_PER_CONNECTION,
-        PyroConf.TRANSFER_CRYPTO_WORKERS)
+        PyroConf.TRANSFER_CRYPTO_WORKERS, PyroConf.TRANSFER_PROFILE,
+        PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET, PyroConf.MIRROR_SOURCE_PINS)
 
 
 # -------------------------------------------------------------------------------------

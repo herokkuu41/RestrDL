@@ -5,11 +5,16 @@ from contextlib import asynccontextmanager
 
 
 class UploadWindow:
-    def __init__(self, initial, maximum, step, interval=5, cooldown=30, gain=0.10):
+    def __init__(self, initial, maximum, step, interval=5, cooldown=30, gain=0.10,
+                 headroom=None, adaptive=True):
         self.limit = self.confirmed = initial
         self.initial = initial
         self.maximum, self.step = maximum, step
         self.interval, self.cooldown, self.gain = interval, cooldown, gain
+        self.headroom = headroom or (lambda: True)
+        self.adaptive = adaptive
+        self.recovery_until = 0
+        self.confirmed_rate = 0
         self.condition = asyncio.Condition()
         self.active = self.waiting = self.pending = 0
         self.acked = self.busy_acked = 0
@@ -20,11 +25,15 @@ class UploadWindow:
         self.last_sample = time.monotonic()
         self.next_trial = self.last_sample
 
-    def reset(self):
+    def reset(self, warm=None):
         """Discard rate history between busy periods; retain a throttle cooldown."""
         now = time.monotonic()
-        start = min(self.initial, self.confirmed) if now < self.next_trial else self.initial
+        start = min(warm or self.initial, self.maximum)
+        if now < self.recovery_until:
+            start = min(start, self.confirmed)
         self.limit = self.confirmed = start
+        if warm is None:
+            self.confirmed_rate = 0
         self.trial = False
         self.samples.clear()
         self.baseline = None
@@ -65,6 +74,12 @@ class UploadWindow:
 
     def sample(self, rate, saturated, now):
         self.rate = rate
+        if not self.headroom():
+            self.confirmed = max(1, min(self.confirmed, self.limit - self.step))
+            self.confirmed_rate = 0
+            return self.rollback(now, "resource-pressure")
+        if not self.adaptive:
+            return None
         if not saturated or rate <= 0:
             self.samples.clear()
             if self.trial:
@@ -79,6 +94,7 @@ class UploadWindow:
             if average < self.baseline * (1 + self.gain):
                 return self.rollback(now, "plateau")
             self.confirmed = self.limit
+            self.confirmed_rate = average
             self.trial = False
             self.baseline = None
             self.next_trial = now + self.cooldown
@@ -103,5 +119,7 @@ class UploadWindow:
         self.confirmed = max(1, self.limit // 2)
         now = time.monotonic()
         self.rollback(now, "throttle")
+        self.recovery_until = now + self.cooldown
+        self.confirmed_rate = 0
         self.acked = self.busy_acked = 0
         self.last_sample = now

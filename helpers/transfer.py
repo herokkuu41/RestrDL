@@ -22,6 +22,7 @@ from pyrogram.errors import (
 from config import PyroConf
 from helpers.fast_download import CHUNK_SIZE, MTProtoWorkerSession, extract_media_info, get_file_location
 from helpers.transfer_window import UploadWindow
+from helpers.transfer_resources import ResourceMonitor
 from logger import LOGGER
 
 PART_SIZE = 512 * 1024
@@ -256,13 +257,19 @@ class TransferProgress:
     """One progress message, aggregated across an album."""
     def __init__(self, message=None):
         self.message = message
-        self.started = time.monotonic()
-        self.last_edit = self.started
-        self.last_log = self.started
+        self.started = None
+        self.last_edit = self.last_log = time.monotonic()
+        self.rate_at = self.last_edit
+        self.rate_bytes = (0, 0)
         self.states = {}
         self.lock = asyncio.Lock()
 
+    def begin(self):
+        if self.started is None:
+            self.started = self.last_edit = self.last_log = self.rate_at = time.monotonic()
+
     async def __call__(self, key, downloaded, uploaded, total):
+        self.begin()
         self.states[key] = (downloaded, uploaded, total)
         now = time.monotonic()
         down, up, size = map(sum, zip(*self.states.values()))
@@ -280,6 +287,10 @@ class TransferProgress:
             return
         async with self.lock:
             self.last_edit = now
+            interval = max(now - self.rate_at, 0.001)
+            down_rate = max(0, down - self.rate_bytes[0]) / interval / CHUNK_SIZE
+            up_rate = max(0, up - self.rate_bytes[1]) / interval / CHUNK_SIZE
+            self.rate_at, self.rate_bytes = now, (down, up)
             fraction = min(up / size, 1)
             filled = int(fraction * 12)
             bar = "▰" * filled + "▱" * (12 - filled)
@@ -287,14 +298,16 @@ class TransferProgress:
                 f"⚡ **TRANSFER LIVE**\n{bar}  `{fraction:.0%}`\n\n"
                 f"📥 **Download**\n"
                 f"Downloaded: {down / CHUNK_SIZE:.1f}/{size / CHUNK_SIZE:.1f} MiB\n"
+                f"Current speed: `{down_rate:.2f} MiB/s`\n"
                 f"Average speed: `{down / elapsed / CHUNK_SIZE:.2f} MiB/s`\n\n"
                 f"📤 **Upload • acknowledged by Telegram**\n"
                 f"Uploaded (confirmed): {up / CHUNK_SIZE:.1f}/{size / CHUNK_SIZE:.1f} MiB\n"
+                f"Current speed: `{up_rate:.2f} MiB/s`\n"
                 f"Average speed: `{up / elapsed / CHUNK_SIZE:.2f} MiB/s`\n\n"
                 f"⏱ **Elapsed** `{elapsed:.0f}s`  •  🧠 **Streaming in memory**"
             )
             try:
-                await self.message.edit(text, parse_mode=ParseMode.MARKDOWN)
+                await asyncio.wait_for(self.message.edit(text, parse_mode=ParseMode.MARKDOWN), timeout=3)
             except (FloodWait, AuthKeyDuplicated, pyrogram.StopTransmission):
                 raise
             except Exception as error:
@@ -325,10 +338,19 @@ class TransferManager:
         self.disk_lock = asyncio.Lock()
         self.disk_reserved = 0
         self.paused_until = {"download": 0, "upload": 0}
+        self.throttle_generation = [0]
         self.upload_users = set()
+        self.profiles = {}
+        self.profile_routes = {}
+        self.resources = ResourceMonitor(PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET)
         self.upload_window = UploadWindow(self.upload_initial, self.uploads.capacity,
             len(self.uploads.sessions), PyroConf.TRANSFER_TUNE_INTERVAL,
-            PyroConf.TRANSFER_TUNE_COOLDOWN, PyroConf.TRANSFER_TUNE_MIN_GAIN)
+            PyroConf.TRANSFER_TUNE_COOLDOWN, PyroConf.TRANSFER_TUNE_MIN_GAIN,
+            self.resources.has_headroom, self.adaptive)
+        self.download_window = UploadWindow(self.downloads.capacity, self.downloads.capacity,
+            len(self.downloads.sessions), PyroConf.TRANSFER_TUNE_INTERVAL,
+            PyroConf.TRANSFER_TUNE_COOLDOWN, PyroConf.TRANSFER_TUNE_MIN_GAIN,
+            self.resources.has_headroom, self.adaptive)
 
     async def invoke(self, worker, query, direction):
         """Expose server waits so all files pause dispatch in that direction."""
@@ -337,30 +359,42 @@ class TransferManager:
             while self.paused_until[direction] > time.monotonic():
                 await asyncio.sleep(self.paused_until[direction] - time.monotonic())
             try:
-                if direction == "upload":
-                    # Retry admission uses the reduced window after a throttle;
-                    # refused RPCs must not all resume with their old permits.
-                    async with self.upload_window.lease():
-                        if self.paused_until[direction] > time.monotonic():
-                            continue
-                        result = await worker.session.invoke(query, sleep_threshold=0, retries=0)
-                        if result is True and isinstance(query, (
-                                raw.functions.upload.SaveFilePart, raw.functions.upload.SaveBigFilePart)):
-                            window = self.upload_window
-                            change = window.acknowledge(len(query.bytes))
-                            if change:
-                                LOGGER(__name__).info(
-                                    "transfer=%08x tuning=%s upload-window=%s confirmed=%s maximum=%s "
-                                    "ack-sample=%.2f MiB/s",
-                                    query.file_id & 0xffffffff, change, window.limit, window.confirmed,
-                                    window.maximum, window.rate / CHUNK_SIZE)
-                        return result
-                return await worker.session.invoke(query, sleep_threshold=0, retries=0)
+                window = self.upload_window if direction == "upload" else self.download_window
+                # Refused requests re-enter the affected direction's smaller
+                # window after waiting, instead of resuming as one burst.
+                async with window.lease():
+                    if self.paused_until[direction] > time.monotonic():
+                        continue
+                    result = await worker.session.invoke(query, sleep_threshold=0, retries=0)
+                    amount = 0
+                    if result is True and isinstance(query, (
+                            raw.functions.upload.SaveFilePart, raw.functions.upload.SaveBigFilePart)):
+                        amount = len(query.bytes)
+                    elif isinstance(result, raw.types.upload.File):
+                        amount = len(result.bytes)
+                    change = window.acknowledge(amount) if amount else None
+                    if change:
+                        if change == "resource-pressure":
+                            self.profiles.clear()
+                        identity = getattr(query, "file_id", getattr(getattr(query, "location", None), "id", 0))
+                        LOGGER(__name__).info(
+                            "transfer=%08x direction=%s tuning=%s window=%s confirmed=%s maximum=%s "
+                            "sample=%.2f MiB/s", identity & 0xffffffff, direction, change,
+                            window.limit, window.confirmed, window.maximum, window.rate / CHUNK_SIZE)
+                    return result
             except (FloodWait, FloodPremiumWait) as error:
                 attempts += 1
+                now = time.monotonic()
+                already_paused = self.paused_until[direction] > now
+                if not already_paused:
+                    self.throttle_generation[0] += 1
                 self.paused_until[direction] = max(
-                    self.paused_until[direction], time.monotonic() + error.value)
-                self.upload_window.backoff()
+                    self.paused_until[direction], now + error.value)
+                self.profiles.clear()
+                if not already_paused:
+                    window = self.upload_window if direction == "upload" else self.download_window
+                    if now >= window.recovery_until:
+                        window.backoff()
                 LOGGER(__name__).warning("Relay throttle: direction=%s wait=%ss", direction, error.value)
                 if error.value > 30 or attempts == 3:
                     raise
@@ -387,7 +421,11 @@ class TransferManager:
             if not isinstance(response, raw.types.upload.File) or len(response.bytes) != expected:
                 raise ValueError(f"Invalid download chunk at {offset}: expected {expected} bytes")
             return response.bytes
-        return await retry(operation)
+        self.download_window.pending += 1
+        try:
+            return await retry(operation)
+        finally:
+            self.download_window.pending -= 1
 
     async def put_part(self, bot, file_id, part, count, size, data):
         dc = await bot.storage.dc_id()
@@ -417,6 +455,8 @@ class TransferManager:
                       "audio": ".mp3", "voice": ".ogg"}
         name = safe_name(name, f"{kind}_{message.id}{extensions.get(kind, '.bin')}")
         async with self.active:
+            if isinstance(progress, TransferProgress):
+                progress.begin()
             for attempt in range(2):
                 try:
                     try:
@@ -452,9 +492,23 @@ class TransferManager:
         transfer_id = f"{file_id & 0xffffffff:08x}"
         last_log = started
         token = object()
+        profile_key = (id(bot), getattr(fid, "dc_id", None), native,
+                       self.downloads.capacity, self.upload_initial, self.uploads.capacity,
+                       self.budget.limit)
+        profile = self.profiles.get(profile_key)
         if not self.upload_users:
-            window.reset()
+            self.resources.has_headroom()
+            warm = profile[0] if (profile and profile[1] > started and self.adaptive
+                                 and self.resources.has_headroom()) else None
+            window.reset(warm)
+            self.download_window.reset()
+            LOGGER(__name__).info("transfer=%s start window=%s/%s warm=%s cpu=%.1f%% memory=%.1f%%",
+                transfer_id, window.limit, window.maximum, warm is not None,
+                self.resources.cpu, self.resources.memory)
         self.upload_users.add(token)
+        self.profile_routes[token] = profile_key
+        completed = False
+        generation = self.throttle_generation[0]
         downloaded = uploaded = 0
         key = (getattr(getattr(message, "chat", None), "id", None), message.id)
 
@@ -463,12 +517,14 @@ class TransferManager:
             now = time.monotonic()
             if now - last_log >= 15:
                 last_log = now
+                self.resources.has_headroom()
                 LOGGER(__name__).info(
                     "transfer=%s produced=%s acked=%s queue-estimate=%s window=%s/%s inflight=%s "
-                    "buffer=%s/%s waiting=%s",
+                    "buffer=%s/%s waiting=%s cpu=%.1f%% memory=%.1f%%",
                     transfer_id, downloaded, uploaded, queue.qsize() * PART_SIZE,
                     window.limit, window.maximum, window.active, self.budget.used,
-                    self.budget.limit, "sink" if window.waiting else "source")
+                    self.budget.limit, "sink" if window.pending > window.active else "source",
+                    self.resources.cpu, self.resources.memory)
             if progress:
                 await progress(key, downloaded, uploaded, size)
 
@@ -581,6 +637,14 @@ class TransferManager:
                 await supervised([produce(), *(consume() for _ in range(self.uploads.capacity + 1))])
             if downloaded != size or uploaded != size:
                 raise ValueError("Transfer completed with missing bytes")
+            completed = True
+            if (window.confirmed_rate > 0 and window.confirmed >= self.upload_initial
+                    and generation == self.throttle_generation[0]
+                    and set(self.profile_routes.values()) == {profile_key}
+                    and self.resources.has_headroom()):
+                if len(self.profiles) >= 32:
+                    self.profiles.pop(next(iter(self.profiles)))
+                self.profiles[profile_key] = (window.confirmed, time.monotonic() + PyroConf.TRANSFER_WARM_TTL)
             elapsed = max(time.monotonic() - started, 0.001)
             down_seconds = max(down_finished - started, 0.001)
             up_seconds = max(up_finished - started, 0.001)
@@ -596,6 +660,9 @@ class TransferManager:
                 return raw.types.InputFileBig(id=file_id, parts=count, name=name)
             return raw.types.InputFile(id=file_id, parts=count, name=name, md5_checksum=digest.hexdigest())
         finally:
+            if not completed:
+                self.profiles.pop(profile_key, None)
+            self.profile_routes.pop(token, None)
             self.upload_users.discard(token)
             for credit in credits:
                 await credit.release()

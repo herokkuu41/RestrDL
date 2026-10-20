@@ -60,6 +60,7 @@ class PinRefused(Exception):
 PRIVATE_ID_OFFSET = 50000     # the other side of a private chat sees another id
 PIN_LOG = []                  # (role, chat_id, message_id, box, both_sides)
 PROTECTED_SOURCE = [False]    # source channel has content protection
+SOURCE_PINS = set()
 
 
 def logical_chat(role, chat_id):
@@ -180,6 +181,8 @@ class FakeChatMessage(object):
 
     def __init__(self, mid):
         self.id = mid
+        self.chat = FakeChat("testchan")
+        self.is_pinned = mid in SOURCE_PINS
         self.empty = False
         if MESSAGE_IS_PHOTO[0]:
             self.media = "photo"
@@ -420,6 +423,7 @@ def reset(bot, user_client):
     CHAT_MESSAGES.clear()
     del PIN_LOG[:]
     PROTECTED_SOURCE[0] = False
+    SOURCE_PINS.clear()
     GROUP_MEMBERS.clear()
     del CHAT_MESSAGE_DOWNLOADS[:]
     MESSAGE_IS_PHOTO[0] = False

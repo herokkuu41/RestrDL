@@ -465,14 +465,15 @@ async def download_single_media(msg, progress_message, start_time):
 
 async def processMediaGroup(chat_message, bot, message, destination_chat_id=None,
                             source_client=None, abort_event=None):
-    media_group_messages = await chat_message.get_media_group()
+    from helpers.source_pins import source_album, attach_source_pairs
     source_client = source_client or getattr(chat_message, "_client", None)
+    media_group_messages = await source_album(source_client, chat_message.chat.id, chat_message.id)
     progress_message = await message.reply(f"**Transferring album ({len(media_group_messages)} files)**")
     try:
         sent = await relay_album(source_client, bot, media_group_messages,
                                  destination_chat_id or message.chat.id,
                                  progress_message=progress_message, abort_event=abort_event)
-        return sent[0] if sent else None
+        return attach_source_pairs(media_group_messages, sent)
     finally:
         try:
             await progress_message.delete()

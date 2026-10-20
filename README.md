@@ -31,13 +31,14 @@
 ## Streaming transfers on a 2 GB server
 
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
-uses four download and four upload connections across the entire bot, with at most two
-files active at once. Each download connection permits two outstanding requests;
+defaults to the `throughput` profile: eight download and eight upload connections
+across the entire bot, with at most two files active at once. Each download connection
+permits four outstanding requests;
 each upload connection starts with four. This hides request latency without opening
 more connections. Large-file ranges enter the upload queue as they finish, so a slow
 range does not hold up ready parts. Small files retain ordered MD5 calculation.
 Albums share these limits. Queued data, upload slices, and retry
-payloads have a shared 64 MiB budget; this is a payload budget, not a cap on total process
+payloads have a shared 128 MiB budget; this is a payload budget, not a cap on total process
 RAM. TgCrypto is required and checked at startup.
 
 Uploads begin while downloads are still running. Progress shows downloaded bytes and
@@ -47,9 +48,10 @@ The existing server-side copy/forward path remains the first choice when availab
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `PARALLEL_DOWNLOAD_WORKERS` | 4 | Global download connection slots |
-| `PARALLEL_UPLOAD_WORKERS` | 4 | Global upload connection slots |
-| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 2 | Maximum outstanding RPCs per download connection |
+| `TRANSFER_PROFILE` | throughput | Preset: throughput or balanced; explicit overrides take precedence |
+| `PARALLEL_DOWNLOAD_WORKERS` | 8 | Global download connection slots |
+| `PARALLEL_UPLOAD_WORKERS` | 8 | Global upload connection slots |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 4 | Maximum outstanding RPCs per download connection |
 | `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting upload window per connection |
 | `TRANSFER_ADAPTIVE` | true | Trial larger upload windows using acknowledged throughput |
 | `MAX_UPLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global upload RPC cap per connection |
@@ -57,14 +59,22 @@ The existing server-side copy/forward path remains the first choice when availab
 | `TRANSFER_TUNE_COOLDOWN` | 30 | Seconds before another capacity trial |
 | `TRANSFER_TUNE_MIN_GAIN` | 0.10 | Minimum fractional ACK throughput improvement |
 | `TRANSFER_CRYPTO_WORKERS` | 4 | Native encryption/decryption executor workers |
+| `TRANSFER_WARM_TTL` | 600 | Seconds a confirmed upload window remains reusable for its route |
+| `TRANSFER_CPU_TARGET` | 85 | CPU percentage ceiling for growth, relative to the container quota |
+| `TRANSFER_MEMORY_TARGET` | 80 | Container memory percentage ceiling for growth |
+| `MIRROR_SOURCE_PINS` | true | Pin delivered copies of posts pinned in the source |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
-| `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
+| `TRANSFER_BUFFER_MIB` | 128 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
 
 Existing environment variables override defaults: update any old
-`DOWNLOAD_REQUESTS_PER_CONNECTION=1` / `UPLOAD_REQUESTS_PER_CONNECTION=1` values to
-`2` / `4` to use the new starting windows. Set `TRANSFER_ADAPTIVE=false` for fixed
+request counts, connection counts and buffer settings to match `config.env.sample`.
+Setting the profile alone does not replace explicit old overrides. The balanced preset
+uses four connections per direction, two download requests per connection, and 64 MiB.
+The throughput preset raises source read-ahead from 8 to 32 simultaneous ranges and
+starts at 32 outstanding upload parts, with a hard ceiling of 64. Set
+`TRANSFER_ADAPTIVE=false` for fixed
 request counts. Startup rejects unsafe or inconsistent limits; at most 16 connections
 per direction, 8 requests per connection, 4 active files, and 512 MiB of payload are allowed.
 CDN streaming
@@ -83,16 +93,24 @@ Active files share one window and require two source-supplied baseline intervals
 two trial intervals; album items cannot multiply the initial window.
 A trial is kept only when average acknowledged throughput improves by at least 10%.
 A plateau or source starvation rolls back the trial, followed by a cooldown. All files
-share the physical pool and byte budget. The starting global limits are 8 download
-RPCs and 16 upload RPCs; adaptive trials share a hard maximum of 32 upload RPCs.
-Rate history is cleared when the manager becomes idle; no learned profiles or
-credentials are cached between busy periods. A recent throttle cooldown is retained.
+share the physical pool and byte budget. Confirmed windows are reused for up to ten
+minutes for the same bot, source DC, transfer mode, and relevant configuration. Only
+successful transfers with confirmed measurements qualify. Expired profiles, failed
+transfers and real throttling invalidate reuse; partial trial settings are never cached.
+This avoids rebuilding capacity for each next video while keeping stale route settings
+from persisting indefinitely. A recent throttle cooldown is retained.
+
+CPU/memory checks use cgroup v2 or v1 limits when available, including fractional CPU
+quotas such as 150%. Trials stop and upload concurrency shrinks under pressure. They
+can grow again when pressure clears and measured ACK rates justify it. Larger limits
+allow the service to use spare resources; they cannot make Telegram accept bytes faster
+than its own route or account limits. Payload memory stays bounded independently of file size.
 
 These changes apply the guide's latency hiding, bounded parallelism, native CPU work,
 ACK-based tuning and local retry patterns. The existing 1 MiB download / 512 KiB upload
 parts remain within Telegram's protocol limits; HTTP-specific range sizes and FFmpeg
-transforms from the guide do not apply to the normal Telegram relay. The shared 64 MiB
-budget is retained because more buffering alone cannot raise sustained destination speed.
+transforms from the guide do not apply to the normal Telegram relay. The throughput
+profile's 128 MiB budget provides more read-ahead while leaving headroom on a 2 GiB server.
 
 ### Measure real speed (optional)
 
@@ -120,8 +138,10 @@ without credentials, network requests or test posts, run:
 python -B scripts/benchmark_pipeline.py --mib 64 --latency-ms 20 --repeats 3
 ```
 
-This isolates one-request scheduling versus pipelined requests with the same four
-connections and simulated per-RPC latency. It verifies every payload and reports ACK
+This compares one-request scheduling, the prior four-connection pipeline, and the
+eight-connection throughput profile with simulated per-RPC latency. Each mode reuses
+one manager for consecutive files to catch leaked buffer credits or shrinking capacity.
+It verifies every payload and reports ACK
 throughput, first acknowledgement, CPU time, and peak reserved payload. It excludes
 encryption, real network conditions and Telegram limits, so its speedup is not a
 prediction of production throughput.
@@ -146,7 +166,11 @@ Your target **7.5 MB/s equals 60 Mbps**, or approximately 7.15 MiB/s. A sample a
 throughput. Telegram can limit non-Premium source downloads. Short waits (up to 30
 seconds) are handled by the transfer scheduler on the exact refused request, with at
 most three attempts. Waits are exposed instead of hidden inside the library; they
-pause new requests across files in the affected direction and reduce upload windows.
+pause new requests across files in the affected direction. One upload throttle episode
+reduces the window once even when many outstanding parts receive the same error. Source
+throttles reduce only the download window, which can recover through measured trials;
+they no longer reduce the upload window. This removes a code-induced capacity
+ratchet across videos; genuine repeated service limits still require waiting.
 Completed chunks, the upload file ID,
 and acknowledged parts are retained. The whole-file restart loop is removed for
 both single media and albums. Longer waits stop the batch instead of repeatedly
@@ -162,6 +186,8 @@ Direction rates are averages from
 relay start until that direction finishes, including startup and backpressure; they are
 not isolated download-only or upload-only benchmarks. Telegram progress edits occur at
 most every five seconds, and a slow edit no longer blocks other data workers.
+Progress clocks start when a file gets a transfer slot, excluding time queued behind
+earlier videos. Progress displays both recent interval speed and active-transfer average.
 
 The first successful **source-order** post is pinned as soon as all earlier candidates
 finish or fail; a later quick text post cannot take the pin from earlier media. Private
@@ -170,9 +196,27 @@ use the required `topics` field for Pyrofork 2.3.69, so completed sends are coun
 
 After deploying, restart with the new code and check the startup `Transfer settings`
 log. Connection-count environment values override defaults, but old 2/4 requests-per-connection
-values now control real pool limits. Keep four connections initially. A 64 MiB
-payload budget stays well within a 2 GB server without requiring full RAM/CPU utilization.
-Increase connection counts only when controlled measurements show a gain without waits.
+values now control real pool limits. Apply the updated sample's eight connections,
+four requests per connection and 128 MiB budget to enable the throughput profile on
+an existing deployment. `/logs` reports the effective settings, warm window reuse,
+resource pressure, and Telegram waits. More CPU/RAM use is useful only while ACK
+throughput improves.
+
+### Mirror pins from the source
+
+`MIRROR_SOURCE_PINS=true` automatically pins destination copies of source-pinned
+posts, including the specific pinned members of an album. It works with server-side
+copies and streamed reuploads, in channels and the bot chat. Source state is read when
+the post is fetched; this does not watch for later pin/unpin changes in the original chat.
+The library's discarded raw `pinned` flag is preserved during the existing source
+metadata request rather than adding one lookup per video. In private chats, pinning
+uses the account that sent the copy and that account's message ID namespace.
+
+The batch's existing Yes/No question controls the optional first-post pin; source pins
+are mirrored independently. Pinning a mirrored first post is not repeated, and changing
+the first-post choice to No does not remove a source pin. Set `MIRROR_SOURCE_PINS=false`
+to disable mirroring. The destination account needs the applicable pin/edit permissions;
+a failed pin is reported after delivery and never causes the video to be sent again.
 
 ### Run regression tests without modifying runtime files
 

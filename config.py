@@ -42,10 +42,13 @@ class PyroConf(object):
     # How long an error message stays visible before the bot deletes it again.
     ERROR_MESSAGE_TTL = int(getenv("ERROR_MESSAGE_TTL", "300"))
 
-    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "4"))
+    TRANSFER_PROFILE = getenv("TRANSFER_PROFILE", "throughput").lower()
+    if TRANSFER_PROFILE not in ("balanced", "throughput"):
+        raise ValueError("TRANSFER_PROFILE must be balanced or throughput")
+    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
-    PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "4"))
-    DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "2"))
+    PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
+    DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "4" if TRANSFER_PROFILE == "throughput" else "2"))
     UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))
     TRANSFER_ADAPTIVE = getenv("TRANSFER_ADAPTIVE", "true").lower() in ("true", "1", "yes")
     MAX_UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("MAX_UPLOAD_REQUESTS_PER_CONNECTION", "8"))
@@ -53,8 +56,12 @@ class PyroConf(object):
     TRANSFER_TUNE_COOLDOWN = float(getenv("TRANSFER_TUNE_COOLDOWN", "30"))
     TRANSFER_TUNE_MIN_GAIN = float(getenv("TRANSFER_TUNE_MIN_GAIN", "0.10"))
     TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "4"))
+    TRANSFER_WARM_TTL = float(getenv("TRANSFER_WARM_TTL", "600"))
+    TRANSFER_CPU_TARGET = float(getenv("TRANSFER_CPU_TARGET", "85"))
+    TRANSFER_MEMORY_TARGET = float(getenv("TRANSFER_MEMORY_TARGET", "80"))
+    MIRROR_SOURCE_PINS = getenv("MIRROR_SOURCE_PINS", "true").lower() in ("true", "1", "yes")
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
-    TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
+    TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "128" if TRANSFER_PROFILE == "throughput" else "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
     # Board vector rendering, separate from unchanged Telegram transfer settings.
     WATCH_BOARD_WIDTH = int(getenv("WATCH_BOARD_WIDTH", "1920"))
@@ -99,6 +106,9 @@ class PyroConf(object):
         raise ValueError("Invalid transfer tuning interval, cooldown or minimum gain")
     if TRANSFER_BUFFER_MIB > 512:
         raise ValueError("TRANSFER_BUFFER_MIB must not exceed 512")
+    if not (0 < TRANSFER_WARM_TTL <= 3600 and 10 <= TRANSFER_CPU_TARGET <= 95
+            and 10 <= TRANSFER_MEMORY_TARGET <= 95):
+        raise ValueError("Invalid warm profile TTL or resource targets")
     if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
         raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 
