@@ -45,11 +45,14 @@ class PyroConf(object):
     PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
     PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "4"))
-    # Restore the pre-06:11 single-RPC scheduling, even when deployment still
-    # contains the previous 2/4 environment overrides. Benchmark managers can
-    # explicitly request different scheduling without changing production.
-    DOWNLOAD_REQUESTS_PER_CONNECTION = 1
-    UPLOAD_REQUESTS_PER_CONNECTION = 1
+    DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "2"))
+    UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))
+    TRANSFER_ADAPTIVE = getenv("TRANSFER_ADAPTIVE", "true").lower() in ("true", "1", "yes")
+    MAX_UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("MAX_UPLOAD_REQUESTS_PER_CONNECTION", "8"))
+    TRANSFER_TUNE_INTERVAL = float(getenv("TRANSFER_TUNE_INTERVAL", "5"))
+    TRANSFER_TUNE_COOLDOWN = float(getenv("TRANSFER_TUNE_COOLDOWN", "30"))
+    TRANSFER_TUNE_MIN_GAIN = float(getenv("TRANSFER_TUNE_MIN_GAIN", "0.10"))
+    TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "4"))
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
     TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
@@ -77,12 +80,25 @@ class PyroConf(object):
 
     for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
                   "DOWNLOAD_REQUESTS_PER_CONNECTION", "UPLOAD_REQUESTS_PER_CONNECTION",
+                  "MAX_UPLOAD_REQUESTS_PER_CONNECTION", "TRANSFER_CRYPTO_WORKERS",
                   "MAX_ACTIVE_TRANSFERS",
                   "TRANSFER_BUFFER_MIB", "DISK_RESERVE_MIB"):
         if locals()[_name] <= 0:
             raise ValueError(f"{_name} must be positive")
-    if max(DOWNLOAD_REQUESTS_PER_CONNECTION, UPLOAD_REQUESTS_PER_CONNECTION) > 8:
+    if max(DOWNLOAD_REQUESTS_PER_CONNECTION, UPLOAD_REQUESTS_PER_CONNECTION,
+           MAX_UPLOAD_REQUESTS_PER_CONNECTION) > 8:
         raise ValueError("Requests per connection must not exceed 8")
+    if TRANSFER_CRYPTO_WORKERS > 8:
+        raise ValueError("TRANSFER_CRYPTO_WORKERS must not exceed 8")
+    if max(PARALLEL_DOWNLOAD_WORKERS, PARALLEL_UPLOAD_WORKERS) > 16 or MAX_ACTIVE_TRANSFERS > 4:
+        raise ValueError("Use at most 16 connections per direction and 4 active transfers")
+    if MAX_UPLOAD_REQUESTS_PER_CONNECTION < UPLOAD_REQUESTS_PER_CONNECTION:
+        raise ValueError("Maximum upload requests must be at least the starting value")
+    if not (0 < TRANSFER_TUNE_INTERVAL <= 60 and 0 < TRANSFER_TUNE_COOLDOWN <= 600
+            and 0 < TRANSFER_TUNE_MIN_GAIN <= 1):
+        raise ValueError("Invalid transfer tuning interval, cooldown or minimum gain")
+    if TRANSFER_BUFFER_MIB > 512:
+        raise ValueError("TRANSFER_BUFFER_MIB must not exceed 512")
     if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
         raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 

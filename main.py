@@ -1727,15 +1727,20 @@ async def cancel_all_tasks(_, message):
 
 async def initialize():
     from pyrogram.crypto import aes
+    from helpers.transfer import configure_crypto
     if aes.tgcrypto is None:
         raise RuntimeError("TgCrypto is required for fast transfers; install requirements.txt")
+    configure_crypto()
     global download_semaphore
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
     LOGGER(__name__).info(
-        "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, payload-buffer=%s MiB",
+        "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, "
+        "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, crypto-workers=%s",
         PyroConf.PARALLEL_DOWNLOAD_WORKERS, PyroConf.PARALLEL_UPLOAD_WORKERS,
         PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION, PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
-        PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB)
+        PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB,
+        PyroConf.TRANSFER_ADAPTIVE, PyroConf.MAX_UPLOAD_REQUESTS_PER_CONNECTION,
+        PyroConf.TRANSFER_CRYPTO_WORKERS)
 
 
 # -------------------------------------------------------------------------------------

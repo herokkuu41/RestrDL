@@ -22,6 +22,7 @@ async def benchmark(args):
 
     if aes.tgcrypto is None:
         raise RuntimeError("Install TgCrypto before benchmarking")
+    transfer.configure_crypto()
     target = int(args.target) if args.target.lstrip("-").isdigit() else args.target
     source = Client("benchmark-source", session_string=PyroConf.SESSION_STRING,
                     api_id=PyroConf.API_ID, api_hash=PyroConf.API_HASH, workers=8)
@@ -51,9 +52,12 @@ async def benchmark(args):
             print(json.dumps({"mode": "native", "skipped": "not enough disk space for baseline"}))
         modes = [("stream-4-before", 4, 1, 1)] + [
             (f"pipeline-{connections}", connections, 2, 4) for connections in args.connections]
+        if args.adaptive:
+            modes.append(("adaptive-4", 4, 2, None))
         for mode, connections, download_requests, upload_requests in modes:
             manager = transfer.TransferManager(downloads=connections, uploads=connections,
-                download_requests=download_requests, upload_requests=upload_requests)
+                download_requests=download_requests, upload_requests=upload_requests,
+                adaptive=upload_requests is None)
             transfer._manager = manager
             transfer._manager_loop = asyncio.get_running_loop()
             try:
@@ -76,6 +80,7 @@ def report(mode, size, started, message_id, buffer_peak=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="Actually upload test posts to the destination")
+    parser.add_argument("--adaptive", action="store_true", help="Add an ACK-tuned four-connection trial")
     parser.add_argument("--connections", nargs="+", type=int, choices=range(2, 9), default=[2, 4],
                         help="Connection counts to test for the new pipeline (default: 2 4)")
     parser.add_argument("--source", required=True, help="Representative Telegram post URL")

@@ -32,10 +32,10 @@
 
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
 uses four download and four upload connections across the entire bot, with at most two
-files active at once. Transfer scheduling is restored to the version before the
-07 October 2026 06:11 IST commit: one request in flight per connection (4 download
-RPCs / 4 upload RPCs globally), with chunks enqueued in source order. Downloads
-and uploads still overlap. Small files retain ordered MD5 calculation.
+files active at once. Each download connection permits two outstanding requests;
+each upload connection starts with four. This hides request latency without opening
+more connections. Large-file ranges enter the upload queue as they finish, so a slow
+range does not hold up ready parts. Small files retain ordered MD5 calculation.
 Albums share these limits. Queued data, upload slices, and retry
 payloads have a shared 64 MiB budget; this is a payload budget, not a cap on total process
 RAM. TgCrypto is required and checked at startup.
@@ -49,15 +49,25 @@ The existing server-side copy/forward path remains the first choice when availab
 |---|---:|---|
 | `PARALLEL_DOWNLOAD_WORKERS` | 4 | Global download connection slots |
 | `PARALLEL_UPLOAD_WORKERS` | 4 | Global upload connection slots |
-| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 1 | Fixed production RPCs per download connection; old overrides ignored |
-| `UPLOAD_REQUESTS_PER_CONNECTION` | 1 | Fixed production RPCs per upload connection; old overrides ignored |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 2 | Maximum outstanding RPCs per download connection |
+| `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting upload window per connection |
+| `TRANSFER_ADAPTIVE` | true | Trial larger upload windows using acknowledged throughput |
+| `MAX_UPLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global upload RPC cap per connection |
+| `TRANSFER_TUNE_INTERVAL` | 5 | Seconds per ACK rate sample |
+| `TRANSFER_TUNE_COOLDOWN` | 30 | Seconds before another capacity trial |
+| `TRANSFER_TUNE_MIN_GAIN` | 0.10 | Minimum fractional ACK throughput improvement |
+| `TRANSFER_CRYPTO_WORKERS` | 4 | Native encryption/decryption executor workers |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
 | `TRANSFER_BUFFER_MIB` | 64 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
 
 Existing environment variables override defaults: update any old
-`PARALLEL_DOWNLOAD_WORKERS=3` value to `4` to use the new defaults. CDN streaming
+`DOWNLOAD_REQUESTS_PER_CONNECTION=1` / `UPLOAD_REQUESTS_PER_CONNECTION=1` values to
+`2` / `4` to use the new starting windows. Set `TRANSFER_ADAPTIVE=false` for fixed
+request counts. Startup rejects unsafe or inconsistent limits; at most 16 connections
+per direction, 8 requests per connection, 4 active files, and 512 MiB of payload are allowed.
+CDN streaming
 needs at least two download slots because it opens both an origin and a CDN session.
 With only one or two download connections, the manager admits one active file so CDN
 streaming cannot deadlock another producer holding the memory budget. With four download
@@ -67,6 +77,22 @@ can be reserved. Oversized files are rejected before downloading using the desti
 bot's upload limit (normally 2000 MiB), even when the source user has Premium.
 Failed/cancelled transfers release their buffers and connection slots. Albums are sent
 only after every item is prepared; failure does not silently send an incomplete album.
+
+The upload tuner changes only outstanding requests, keeping connection counts fixed.
+Active files share one window and require two source-supplied baseline intervals and
+two trial intervals; album items cannot multiply the initial window.
+A trial is kept only when average acknowledged throughput improves by at least 10%.
+A plateau or source starvation rolls back the trial, followed by a cooldown. All files
+share the physical pool and byte budget. The starting global limits are 8 download
+RPCs and 16 upload RPCs; adaptive trials share a hard maximum of 32 upload RPCs.
+Rate history is cleared when the manager becomes idle; no learned profiles or
+credentials are cached between busy periods. A recent throttle cooldown is retained.
+
+These changes apply the guide's latency hiding, bounded parallelism, native CPU work,
+ACK-based tuning and local retry patterns. The existing 1 MiB download / 512 KiB upload
+parts remain within Telegram's protocol limits; HTTP-specific range sizes and FFmpeg
+transforms from the guide do not apply to the normal Telegram relay. The shared 64 MiB
+budget is retained because more buffering alone cannot raise sustained destination speed.
 
 ### Measure real speed (optional)
 
@@ -86,6 +112,20 @@ the defaults; account limits, network conditions, and Telegram throttling can do
 performance. Automated tests establish correctness and overlapping transfers, not a
 guaranteed real-world speed increase.
 
+Add `--adaptive` for one additional real post using the ACK tuner. The benchmark also
+configures the same native crypto pool as production. To measure scheduler changes
+without credentials, network requests or test posts, run:
+
+```sh
+python -B scripts/benchmark_pipeline.py --mib 64 --latency-ms 20 --repeats 3
+```
+
+This isolates one-request scheduling versus pipelined requests with the same four
+connections and simulated per-RPC latency. It verifies every payload and reports ACK
+throughput, first acknowledgement, CPU time, and peak reserved payload. It excludes
+encryption, real network conditions and Telegram limits, so its speedup is not a
+prediction of production throughput.
+
 The updated benchmark sends up to **four** posts with the default arguments: native
 download/upload, the previous four-connection relay (one request per connection), then
 the new pipeline with two and four connections. Add `--connections 4 6` to compare four
@@ -103,9 +143,11 @@ Cloudflare, not Telegram, and is not an Ookla result.
 
 Your target **7.5 MB/s equals 60 Mbps**, or approximately 7.15 MiB/s. A sample above
 60 Mbps in each direction shows headroom to Cloudflare, but cannot establish Telegram
-throughput. Telegram can limit non-Premium source downloads. A detected
-short waits (up to 30 seconds) are handled by the pinned library on the exact refused
-request, as in the earlier transfer version. Completed chunks, the upload file ID,
+throughput. Telegram can limit non-Premium source downloads. Short waits (up to 30
+seconds) are handled by the transfer scheduler on the exact refused request, with at
+most three attempts. Waits are exposed instead of hidden inside the library; they
+pause new requests across files in the affected direction and reduce upload windows.
+Completed chunks, the upload file ID,
 and acknowledged parts are retained. The whole-file restart loop is removed for
 both single media and albums. Longer waits stop the batch instead of repeatedly
 starting files or moving to the next file while throttled. `/killall` cancels an
@@ -114,7 +156,9 @@ and [Premium download limits](https://telegram.org/faq_premium).
 
 `/logs` now includes transfer progress every 15 seconds, plus completion elapsed time,
 download rate, acknowledged upload rate, relay rate, source DC, request/connection limits,
-native CDN usage and the shared payload buffer peak. Direction rates are averages from
+native CDN usage and the shared payload buffer peak. Pipeline logs include a transfer
+ID, queue estimate, current upload window, in-flight work and tuning decisions.
+Direction rates are averages from
 relay start until that direction finishes, including startup and backpressure; they are
 not isolated download-only or upload-only benchmarks. Telegram progress edits occur at
 most every five seconds, and a slow edit no longer blocks other data workers.
@@ -126,8 +170,7 @@ use the required `topics` field for Pyrofork 2.3.69, so completed sends are coun
 
 After deploying, restart with the new code and check the startup `Transfer settings`
 log. Connection-count environment values override defaults, but old 2/4 requests-per-connection
-values are ignored so existing deployments use the restored 1/1 scheduling automatically.
-Keep four connections. A 64 MiB
+values now control real pool limits. Keep four connections initially. A 64 MiB
 payload budget stays well within a 2 GB server without requiring full RAM/CPU utilization.
 Increase connection counts only when controlled measurements show a gain without waits.
 

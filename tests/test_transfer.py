@@ -180,6 +180,7 @@ async def test_global_limits_slow_upload_and_cancel(monkeypatch):
         assert backend.peak["source"] <= 4 and backend.peak["bot"] <= 4
         assert backend.rpc_peak["source"] <= manager.downloads.capacity
         assert backend.rpc_peak["bot"] <= manager.uploads.capacity
+        assert backend.rpc_peak["bot"] <= manager.upload_initial
         abort.set()
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
         assert all(isinstance(result, asyncio.CancelledError) for result in results)
@@ -192,7 +193,7 @@ async def test_global_limits_slow_upload_and_cancel(monkeypatch):
         await manager.close()
 
 
-@pytest.mark.parametrize("error", [FloodWait(31), FloodPremiumWait(1), AuthKeyDuplicated(), ValueError("bad chunk")])
+@pytest.mark.parametrize("error", [FloodWait(31), FloodPremiumWait(31), AuthKeyDuplicated(), ValueError("bad chunk")])
 async def test_fatal_errors_propagate_and_drain(monkeypatch, error):
     backend = Backend(monkeypatch)
     backend.error = error
@@ -223,11 +224,12 @@ async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direc
     real_sleep = asyncio.sleep
 
     async def sleep(seconds):
-        if seconds == 9:
+        if 8 < seconds <= 9:
             waits.append(seconds)
             if cancel:
                 waiting.set()
                 await asyncio.Event().wait()
+            manager.paused_until[direction] = 0
             await real_sleep(0)
         else:
             await real_sleep(seconds)
@@ -241,7 +243,7 @@ async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direc
             self.is_started.set()
 
         async def invoke(self, query, **kwargs):
-            assert kwargs["sleep_threshold"] == 30
+            assert kwargs["sleep_threshold"] == 0
             return await Session.invoke(self, query, **kwargs)
 
         async def send(self, query, timeout):
@@ -271,7 +273,7 @@ async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direc
             assert not any(backend.active_rpc.values())
             return
         uploaded = await task
-        assert waits == [9]
+        assert waits and all(8 < seconds <= 9 for seconds in waits)
         assert attempts[("download", 0)] == attempts[("upload", 0)] == 1
         target = ("download", CHUNK_SIZE) if direction == "download" else ("upload", 1)
         assert attempts[target] == 2
@@ -284,9 +286,13 @@ async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direc
         await manager.close()
 
 
-def test_production_restores_single_request_per_connection():
-    assert transfer.PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION == 1
-    assert transfer.PyroConf.UPLOAD_REQUESTS_PER_CONNECTION == 1
+def test_production_request_counts_control_pool_limits(monkeypatch):
+    monkeypatch.setattr(transfer.PyroConf, "DOWNLOAD_REQUESTS_PER_CONNECTION", 2)
+    monkeypatch.setattr(transfer.PyroConf, "UPLOAD_REQUESTS_PER_CONNECTION", 4)
+    monkeypatch.setattr(transfer.PyroConf, "TRANSFER_ADAPTIVE", False)
+    manager = TransferManager(downloads=4, uploads=4)
+    assert manager.downloads.capacity == 8
+    assert manager.uploads.capacity == manager.upload_initial == 16
 
 
 async def test_reference_refresh_once(monkeypatch):
@@ -622,9 +628,10 @@ async def test_pipeline_uses_multiple_rpcs_without_extra_connections(monkeypatch
         await manager.close()
 
 
-async def test_restored_producer_enqueues_in_source_order(monkeypatch):
+@pytest.mark.parametrize("size", [8 * CHUNK_SIZE, 12 * CHUNK_SIZE])
+async def test_slow_range_only_holds_up_small_file_checksum_order(monkeypatch, size):
     backend = Backend(monkeypatch)
-    backend.size[1] = 12 * CHUNK_SIZE
+    backend.size[1] = size
     source, bot = clients()
     manager = TransferManager()
     original = manager.fetch
@@ -642,7 +649,7 @@ async def test_restored_producer_enqueues_in_source_order(monkeypatch):
             if any(backend.parts.values()):
                 break
             await asyncio.sleep(0.005)
-        assert not any(backend.parts.values()), "restored producer waits for the first source chunk"
+        assert bool(any(backend.parts.values())) == (size > 10 * CHUNK_SIZE)
         assert not task.done()
         first_chunk.set()
         result = await asyncio.wait_for(task, 2)
@@ -810,3 +817,137 @@ async def test_cdn_and_regular_file_share_small_memory_budget(monkeypatch, conne
         assert manager.budget.used == 0 and manager.budget.peak <= 8 * CHUNK_SIZE
     finally:
         await manager.close()
+
+
+async def test_repeated_short_throttles_are_bounded_and_reduce_windows(monkeypatch):
+    from helpers.transfer_window import UploadWindow
+    manager = TransferManager()
+    control = UploadWindow(16, 32, 4)
+    manager.upload_window = control
+    worker = NS(session=NS(invoke=AsyncMock(side_effect=FloodPremiumWait(2))))
+    pauses = []
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+        manager.paused_until["upload"] = 0
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    with pytest.raises(FloodPremiumWait):
+        await manager.invoke(worker, raw.functions.help.GetConfig(), "upload")
+    assert worker.session.invoke.await_count == 3
+    assert len(pauses) == 2
+    assert control.limit == control.confirmed == 2
+    await manager.close()
+
+
+async def test_native_crypto_pool_is_configurable_and_preserves_payloads(monkeypatch):
+    from pyrogram.crypto import aes
+    monkeypatch.setattr(transfer, "_crypto_workers", None)
+    monkeypatch.setattr(transfer.PyroConf, "TRANSFER_CRYPTO_WORKERS", 4)
+    previous = MagicMock()
+    monkeypatch.setattr(transfer.pyrogram, "crypto_executor", previous)
+    transfer.configure_crypto()
+    pool = transfer.pyrogram.crypto_executor
+    try:
+        transfer.configure_crypto()
+        assert transfer.pyrogram.crypto_executor is pool
+        previous.shutdown.assert_called_once_with(wait=True)
+        loop = asyncio.get_running_loop()
+        payloads = [bytes([i]) * PART_SIZE for i in range(8)]
+        encrypted = await asyncio.gather(*(
+            loop.run_in_executor(pool, aes.ige256_encrypt, data, b"k" * 32, b"i" * 32)
+            for data in payloads))
+        decrypted = await asyncio.gather(*(
+            loop.run_in_executor(pool, aes.ige256_decrypt, data, b"k" * 32, b"i" * 32)
+            for data in encrypted))
+        assert decrypted == payloads
+    finally:
+        pool.shutdown(wait=True)
+
+
+async def test_adaptive_initial_window_is_shared_across_files(monkeypatch):
+    backend = Backend(monkeypatch)
+    backend.gate = asyncio.Event()
+    backend.size[1] = backend.size[2] = 48 * CHUNK_SIZE
+    source, bot = clients()
+    manager = TransferManager(downloads=4, uploads=4, buffer_mib=64, active=2,
+                              upload_requests=1, adaptive=True)
+    tasks = [asyncio.create_task(manager.prepare(source, bot, message(backend.size[i], i)))
+             for i in (1, 2)]
+    try:
+        for _ in range(100):
+            if backend.rpc_peak["bot"] == manager.upload_initial:
+                break
+            await asyncio.sleep(0.005)
+        assert len(manager.upload_users) == 2
+        assert manager.uploads.capacity == 32
+        assert backend.rpc_peak["bot"] == manager.upload_initial == 4
+        assert manager.upload_window.active == 4
+        backend.gate.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), 3)
+        for result in results:
+            assert b"".join(data for _, data in sorted(backend.parts[result.file.id].items())) == backend.payload(result.size)
+        assert not manager.upload_users and manager.upload_window.active == 0
+        assert manager.budget.used == 0
+    finally:
+        backend.gate.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await manager.close()
+
+
+async def test_dispatch_rechecks_a_throttle_extended_by_another_file(monkeypatch):
+    manager = TransferManager()
+    clock = [1000.0]
+    pauses = []
+    manager.paused_until["upload"] = 1002
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: clock[0])
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+        clock[0] += seconds
+        if len(pauses) == 1:
+            manager.paused_until["upload"] = 1005
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    worker = NS(session=NS(invoke=AsyncMock(return_value=True)))
+    assert await manager.invoke(worker, raw.functions.help.GetConfig(), "upload") is True
+    assert pauses == [2, 3] and clock[0] == 1005
+    worker.session.invoke.assert_awaited_once()
+
+
+async def test_throttled_parts_retry_through_the_reduced_window():
+    from helpers.transfer_window import UploadWindow
+    manager = TransferManager()
+    manager.upload_window = UploadWindow(4, 8, 4)
+    all_refused = asyncio.Event()
+    refused = active = peak = 0
+    attempts = defaultdict(int)
+
+    async def invoke(query, **kwargs):
+        nonlocal refused, active, peak
+        attempts[query.file_part] += 1
+        if attempts[query.file_part] == 1:
+            refused += 1
+            if refused == 4:
+                all_refused.set()
+            await all_refused.wait()
+            raise FloodPremiumWait(1)
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.005)
+            return True
+        finally:
+            active -= 1
+
+    worker = NS(session=NS(invoke=invoke))
+    queries = [raw.functions.upload.SaveFilePart(file_id=1, file_part=i, bytes=b"part")
+               for i in range(4)]
+    results = await asyncio.wait_for(transfer.supervised([
+        manager.invoke(worker, query, "upload") for query in queries]), 3)
+    assert results == [True] * 4
+    assert peak == manager.upload_window.limit == 1
+    assert manager.upload_window.active == manager.upload_window.waiting == 0
+    assert list(attempts.values()) == [2] * 4
