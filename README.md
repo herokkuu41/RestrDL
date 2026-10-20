@@ -31,14 +31,14 @@
 ## Streaming transfers on a 2 GB server
 
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
-defaults to the `throughput` profile: eight download and eight upload connections
+defaults to the `throughput` profile: twelve download and twelve upload connections
 across the entire bot, with at most two files active at once. Each download connection
-permits four outstanding requests;
-each upload connection starts with four. This hides request latency without opening
-more connections. Large-file ranges enter the upload queue as they finish, so a slow
+starts with four outstanding requests;
+each upload connection also starts with four. Both can grow to eight after measured
+improvement. Large-file ranges enter the upload queue as they finish, so a slow
 range does not hold up ready parts. Small files retain ordered MD5 calculation.
 Albums share these limits. Queued data, upload slices, and retry
-payloads have a shared 128 MiB budget; this is a payload budget, not a cap on total process
+payloads have a shared 256 MiB budget; this is a payload budget, not a cap on total process
 RAM. TgCrypto is required and checked at startup.
 
 Uploads begin while downloads are still running. Progress shows downloaded bytes and
@@ -49,24 +49,25 @@ The existing server-side copy/forward path remains the first choice when availab
 | Variable | Default | Meaning |
 |---|---:|---|
 | `TRANSFER_PROFILE` | throughput | Preset: throughput or balanced; explicit overrides take precedence |
-| `PARALLEL_DOWNLOAD_WORKERS` | 8 | Global download connection slots |
-| `PARALLEL_UPLOAD_WORKERS` | 8 | Global upload connection slots |
-| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 4 | Maximum outstanding RPCs per download connection |
+| `PARALLEL_DOWNLOAD_WORKERS` | 12 | Global download connection slots |
+| `PARALLEL_UPLOAD_WORKERS` | 12 | Global upload connection slots |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting download window per connection |
 | `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting upload window per connection |
-| `TRANSFER_ADAPTIVE` | true | Trial larger upload windows using acknowledged throughput |
+| `TRANSFER_ADAPTIVE` | true | Trial larger download and upload windows using acknowledged throughput |
+| `MAX_DOWNLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global download RPC cap per connection |
 | `MAX_UPLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global upload RPC cap per connection |
-| `TRANSFER_TUNE_INTERVAL` | 5 | Seconds per ACK rate sample |
-| `TRANSFER_TUNE_COOLDOWN` | 30 | Seconds before another capacity trial |
-| `TRANSFER_TUNE_MIN_GAIN` | 0.10 | Minimum fractional ACK throughput improvement |
-| `TRANSFER_CRYPTO_WORKERS` | 4 | Native encryption/decryption executor workers |
-| `TRANSFER_WARM_TTL` | 600 | Seconds a confirmed upload window remains reusable for its route |
+| `TRANSFER_TUNE_INTERVAL` | 3 | Seconds per ACK rate sample |
+| `TRANSFER_TUNE_COOLDOWN` | 10 | Seconds before another capacity trial |
+| `TRANSFER_TUNE_MIN_GAIN` | 0.05 | Minimum fractional ACK throughput improvement |
+| `TRANSFER_CRYPTO_WORKERS` | 8 | Native encryption/decryption executor workers |
+| `TRANSFER_WARM_TTL` | 600 | Seconds confirmed request windows remain reusable for their route |
 | `TRANSFER_RPC_TIMEOUT` | 60 | Seconds to wait for one download chunk/upload part request |
 | `TRANSFER_FINALIZE_TIMEOUT` | 120 | Seconds to wait for Telegram media registration or final sending |
-| `TRANSFER_CPU_TARGET` | 85 | CPU percentage ceiling for growth, relative to the container quota |
+| `TRANSFER_CPU_TARGET` | 95 | CPU percentage ceiling for growth, relative to the container quota |
 | `TRANSFER_MEMORY_TARGET` | 80 | Container memory percentage ceiling for growth |
 | `MIRROR_SOURCE_PINS` | true | Pin delivered copies of posts pinned in the source |
 | `MAX_ACTIVE_TRANSFERS` | 2 | Active files, including album items |
-| `TRANSFER_BUFFER_MIB` | 128 | Shared buffered payload budget |
+| `TRANSFER_BUFFER_MIB` | 256 | Shared buffered payload budget |
 | `DISK_RESERVE_MIB` | 256 | Minimum free disk after reserving a fallback file |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Outer post/album processing slots; does not multiply transfer connections |
 
@@ -74,8 +75,10 @@ Existing environment variables override defaults: update any old
 request counts, connection counts and buffer settings to match `config.env.sample`.
 Setting the profile alone does not replace explicit old overrides. The balanced preset
 uses four connections per direction, two download requests per connection, and 64 MiB.
-The throughput preset raises source read-ahead from 8 to 32 simultaneous ranges and
-starts at 32 outstanding upload parts, with a hard ceiling of 64. Set
+The throughput preset starts with 48 simultaneous source ranges and 48 upload parts,
+with independently measured growth up to 96 in each direction. Eight native crypto
+executor threads allow encryption and decryption to use available CPU cores. These
+are shared limits across the service, not per-file multipliers. Set
 `TRANSFER_ADAPTIVE=false` for fixed
 request counts. Startup rejects unsafe or inconsistent limits; at most 16 connections
 per direction, 8 requests per connection, 4 active files, and 512 MiB of payload are allowed.
@@ -90,10 +93,10 @@ bot's upload limit (normally 2000 MiB), even when the source user has Premium.
 Failed/cancelled transfers release their buffers and connection slots. Albums are sent
 only after every item is prepared; failure does not silently send an incomplete album.
 
-The upload tuner changes only outstanding requests, keeping connection counts fixed.
+Both direction tuners change only outstanding requests, keeping connection counts fixed.
 Active files share one window and require two source-supplied baseline intervals and
 two trial intervals; album items cannot multiply the initial window.
-A trial is kept only when average acknowledged throughput improves by at least 10%.
+A trial is kept only when average acknowledged throughput improves by at least 5%.
 A plateau or source starvation rolls back the trial, followed by a cooldown. All files
 share the physical pool and byte budget. Confirmed windows are reused for up to ten
 minutes for the same bot, source DC, transfer mode, and relevant configuration. Only
@@ -103,8 +106,13 @@ This avoids rebuilding capacity for each next video while keeping stale route se
 from persisting indefinitely. A recent throttle cooldown is retained.
 
 CPU/memory checks use cgroup v2 or v1 limits when available, including fractional CPU
-quotas such as 150%. Trials stop and upload concurrency shrinks under pressure. They
-can grow again when pressure clears and measured ACK rates justify it. Larger limits
+quotas such as 150%. CPU saturation stops additional growth and rolls back an unconfirmed
+trial; it does not keep cutting the established window. Previously the controller could
+remove a connection's worth of requests every sample merely because CPU was busy,
+eventually collapsing to one outstanding request during a video. Actual memory pressure
+still reduces established work, at most once per cooldown. Fixed request mode does not
+apply resource tuning, while server throttling always applies. Both directions can grow
+again when pressure clears and measured ACK rates justify it. Larger limits
 allow the service to use spare resources; they cannot make Telegram accept bytes faster
 than its own route or account limits. Payload memory stays bounded independently of file size.
 
@@ -112,7 +120,11 @@ These changes apply the guide's latency hiding, bounded parallelism, native CPU 
 ACK-based tuning and local retry patterns. The existing 1 MiB download / 512 KiB upload
 parts remain within Telegram's protocol limits; HTTP-specific range sizes and FFmpeg
 transforms from the guide do not apply to the normal Telegram relay. The throughput
-profile's 128 MiB budget provides more read-ahead while leaving headroom on a 2 GiB server.
+profile's 256 MiB payload budget provides more read-ahead on a 2 GiB server. It is a cap,
+not a RAM allocation target: memory is used when a source/sink speed mismatch needs
+buffering. The process, crypto work, sockets, and library allocations use additional RAM.
+Keep the balanced profile on hosts without this headroom. Existing deployment environment
+overrides must be updated or removed to use the new throughput values.
 
 ### Measure real speed (optional)
 
@@ -140,11 +152,13 @@ without credentials, network requests or test posts, run:
 python -B scripts/benchmark_pipeline.py --mib 64 --latency-ms 20 --repeats 3
 ```
 
-This compares one-request scheduling, the prior four-connection pipeline, and the
-eight-connection throughput profile with simulated per-RPC latency. Each mode reuses
+This compares one-request scheduling, the prior four-connection pipeline, the previous
+eight-connection profile, and the twelve-connection throughput profile with simulated
+per-RPC latency. Each mode reuses
 one manager for consecutive files to catch leaked buffer credits or shrinking capacity.
 It verifies every payload and reports ACK
-throughput, first acknowledgement, CPU time, and peak reserved payload. It excludes
+throughput, first acknowledgement, CPU time, peak reserved payload, and ACK rates for
+each quarter of the file to expose a draining slowdown. It excludes
 encryption, real network conditions and Telegram limits, so its speedup is not a
 prediction of production throughput.
 
@@ -183,7 +197,10 @@ and [Premium download limits](https://telegram.org/faq_premium).
 `/logs` now includes transfer progress every 15 seconds, plus completion elapsed time,
 download rate, acknowledged upload rate, relay rate, source DC, request/connection limits,
 native CDN usage and the shared payload buffer peak. Pipeline logs include a transfer
-ID, queue estimate, current upload window, in-flight work and tuning decisions.
+ID, queue estimate, both request windows, in-flight work and tuning decisions. They also
+include recent download/upload throughput, actual RPC response latency per direction,
+process RSS, and CPU quota throttling. Rising RPC latency with low CPU and memory pressure
+points toward the network/Telegram route; high quota throttling indicates a host CPU limit.
 Direction rates are averages from
 relay start until that direction finishes, including startup and backpressure; they are
 not isolated download-only or upload-only benchmarks. Telegram progress edits occur at
@@ -209,8 +226,8 @@ use the required `topics` field for Pyrofork 2.3.69, so completed sends are coun
 
 After deploying, restart with the new code and check the startup `Transfer settings`
 log. Connection-count environment values override defaults, but old 2/4 requests-per-connection
-values now control real pool limits. Apply the updated sample's eight connections,
-four requests per connection and 128 MiB budget to enable the throughput profile on
+values now control real pool limits. Apply the updated sample's twelve connections,
+four starting requests per connection, eight crypto workers and 256 MiB budget on
 an existing deployment. `/logs` reports the effective settings, warm window reuse,
 resource pressure, and Telegram waits. More CPU/RAM use is useful only while ACK
 throughput improves.

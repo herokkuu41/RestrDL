@@ -1750,13 +1750,14 @@ async def initialize():
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
     LOGGER(__name__).info(
         "Transfer settings: connections=%s/%s, requests-per-connection=%s/%s, active=%s, "
-        "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, crypto-workers=%s, "
+        "payload-buffer=%s MiB, adaptive=%s, max-upload-requests=%s, max-download-requests=%s, crypto-workers=%s, "
         "profile=%s, CPU-target=%s%%, memory-target=%s%%, mirror-source-pins=%s, "
         "rpc-timeout=%ss, finalize-timeout=%ss",
         PyroConf.PARALLEL_DOWNLOAD_WORKERS, PyroConf.PARALLEL_UPLOAD_WORKERS,
         PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION, PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
         PyroConf.MAX_ACTIVE_TRANSFERS, PyroConf.TRANSFER_BUFFER_MIB,
         PyroConf.TRANSFER_ADAPTIVE, PyroConf.MAX_UPLOAD_REQUESTS_PER_CONNECTION,
+        PyroConf.MAX_DOWNLOAD_REQUESTS_PER_CONNECTION,
         PyroConf.TRANSFER_CRYPTO_WORKERS, PyroConf.TRANSFER_PROFILE,
         PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET, PyroConf.MIRROR_SOURCE_PINS,
         PyroConf.TRANSFER_RPC_TIMEOUT, PyroConf.TRANSFER_FINALIZE_TIMEOUT)

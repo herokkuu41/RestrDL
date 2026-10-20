@@ -17,8 +17,8 @@ from helpers.transfer import CHUNK_SIZE, PART_SIZE, TransferManager
 
 
 class SimulatedTransfer(TransferManager):
-    def __init__(self, download_requests, upload_requests, latency, connections=4):
-        super().__init__(downloads=connections, uploads=connections, active=1, buffer_mib=128,
+    def __init__(self, download_requests, upload_requests, latency, connections=4, buffer_mib=128):
+        super().__init__(downloads=connections, uploads=connections, active=1, buffer_mib=buffer_mib,
                          download_requests=download_requests, upload_requests=upload_requests,
                          adaptive=False)
         self.read_slots = asyncio.Semaphore(self.downloads.capacity)
@@ -27,6 +27,7 @@ class SimulatedTransfer(TransferManager):
         self.parts = set()
         self.acked = 0
         self.first_ack = None
+        self.quarters = []
 
     async def fetch(self, source, fid, offset, expected):
         async with self.read_slots:
@@ -44,17 +45,23 @@ class SimulatedTransfer(TransferManager):
             self.acked += len(data)
             if self.first_ack is None:
                 self.first_ack = time.perf_counter()
+            while len(self.quarters) < 4 and self.acked >= size * (len(self.quarters) + 1) / 4:
+                self.quarters.append((self.acked, time.perf_counter()))
 
 
 async def benchmark(args):
     size = args.mib * CHUNK_SIZE + 17
-    for mode, connections, down, up in (("one-request", 4, 1, 1), ("pipelined", 4, 2, 4),
-                                       ("throughput", 8, 4, 4)):
-        manager = SimulatedTransfer(down, up, args.latency_ms / 1000, connections)
+    for mode, connections, down, up, buffer_mib in (
+            ("one-request", 4, 1, 1, 128), ("pipelined", 4, 2, 4, 128),
+            ("previous-throughput", 8, 4, 4, 128), ("throughput", 12, 4, 4, 256)):
+        if mode not in args.modes:
+            continue
+        manager = SimulatedTransfer(down, up, args.latency_ms / 1000, connections, buffer_mib)
         try:
             for repeat in range(args.repeats):
                 manager.parts.clear()
                 manager.acked, manager.first_ack = 0, None
+                manager.quarters.clear()
                 bot = SimpleNamespace(rnd_id=lambda: 12345)
                 message = SimpleNamespace(id=1, chat=SimpleNamespace(id=1))
                 started = time.perf_counter()
@@ -64,6 +71,12 @@ async def benchmark(args):
                 if (manager.acked != size or len(manager.parts) != math.ceil(size / PART_SIZE)
                         or manager.budget.used or manager.upload_users):
                     raise ValueError("Incomplete synthetic upload")
+                previous_bytes, previous_time = 0, started
+                quarter_rates = []
+                for acked, completed_at in manager.quarters:
+                    quarter_rates.append(round((acked - previous_bytes) / CHUNK_SIZE /
+                                              max(completed_at - previous_time, 0.001), 3))
+                    previous_bytes, previous_time = acked, completed_at
                 print(json.dumps({
                     "mode": mode, "repeat": repeat + 1, "bytes": size,
                     "connections_per_direction": connections,
@@ -74,6 +87,7 @@ async def benchmark(args):
                     "buffer_peak_bytes": manager.budget.peak,
                     "download_RPC_limit": manager.downloads.capacity,
                     "upload_RPC_limit": manager.uploads.capacity,
+                    "quarter_ack_MiB_per_second": quarter_rates,
                 }))
         finally:
             await manager.close()
@@ -84,6 +98,9 @@ if __name__ == "__main__":
     parser.add_argument("--mib", type=int, choices=range(1, 513), default=64)
     parser.add_argument("--latency-ms", type=float, default=20)
     parser.add_argument("--repeats", type=int, choices=range(1, 11), default=3)
+    parser.add_argument("--modes", nargs="+",
+                        choices=("one-request", "pipelined", "previous-throughput", "throughput"),
+                        default=["one-request", "pipelined", "previous-throughput", "throughput"])
     args = parser.parse_args()
     if not 0 < args.latency_ms <= 1000:
         parser.error("--latency-ms must be in (0, 1000]")

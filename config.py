@@ -45,25 +45,26 @@ class PyroConf(object):
     TRANSFER_PROFILE = getenv("TRANSFER_PROFILE", "throughput").lower()
     if TRANSFER_PROFILE not in ("balanced", "throughput"):
         raise ValueError("TRANSFER_PROFILE must be balanced or throughput")
-    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
+    PARALLEL_DOWNLOAD_WORKERS = int(getenv("PARALLEL_DOWNLOAD_WORKERS", "12" if TRANSFER_PROFILE == "throughput" else "4"))
     MAX_CONCURRENT_TRANSMISSIONS = int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
-    PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
+    PARALLEL_UPLOAD_WORKERS = int(getenv("PARALLEL_UPLOAD_WORKERS", "12" if TRANSFER_PROFILE == "throughput" else "4"))
     DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("DOWNLOAD_REQUESTS_PER_CONNECTION", "4" if TRANSFER_PROFILE == "throughput" else "2"))
     UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))
     TRANSFER_ADAPTIVE = getenv("TRANSFER_ADAPTIVE", "true").lower() in ("true", "1", "yes")
+    MAX_DOWNLOAD_REQUESTS_PER_CONNECTION = int(getenv("MAX_DOWNLOAD_REQUESTS_PER_CONNECTION", "8"))
     MAX_UPLOAD_REQUESTS_PER_CONNECTION = int(getenv("MAX_UPLOAD_REQUESTS_PER_CONNECTION", "8"))
-    TRANSFER_TUNE_INTERVAL = float(getenv("TRANSFER_TUNE_INTERVAL", "5"))
-    TRANSFER_TUNE_COOLDOWN = float(getenv("TRANSFER_TUNE_COOLDOWN", "30"))
-    TRANSFER_TUNE_MIN_GAIN = float(getenv("TRANSFER_TUNE_MIN_GAIN", "0.10"))
-    TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "4"))
+    TRANSFER_TUNE_INTERVAL = float(getenv("TRANSFER_TUNE_INTERVAL", "3"))
+    TRANSFER_TUNE_COOLDOWN = float(getenv("TRANSFER_TUNE_COOLDOWN", "10"))
+    TRANSFER_TUNE_MIN_GAIN = float(getenv("TRANSFER_TUNE_MIN_GAIN", "0.05"))
+    TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
     TRANSFER_WARM_TTL = float(getenv("TRANSFER_WARM_TTL", "600"))
     TRANSFER_RPC_TIMEOUT = float(getenv("TRANSFER_RPC_TIMEOUT", "60"))
     TRANSFER_FINALIZE_TIMEOUT = float(getenv("TRANSFER_FINALIZE_TIMEOUT", "120"))
-    TRANSFER_CPU_TARGET = float(getenv("TRANSFER_CPU_TARGET", "85"))
+    TRANSFER_CPU_TARGET = float(getenv("TRANSFER_CPU_TARGET", "95"))
     TRANSFER_MEMORY_TARGET = float(getenv("TRANSFER_MEMORY_TARGET", "80"))
     MIRROR_SOURCE_PINS = getenv("MIRROR_SOURCE_PINS", "true").lower() in ("true", "1", "yes")
     MAX_ACTIVE_TRANSFERS = int(getenv("MAX_ACTIVE_TRANSFERS", "2"))
-    TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "128" if TRANSFER_PROFILE == "throughput" else "64"))
+    TRANSFER_BUFFER_MIB = int(getenv("TRANSFER_BUFFER_MIB", "256" if TRANSFER_PROFILE == "throughput" else "64"))
     DISK_RESERVE_MIB = int(getenv("DISK_RESERVE_MIB", "256"))
     # Board vector rendering, separate from unchanged Telegram transfer settings.
     WATCH_BOARD_WIDTH = int(getenv("WATCH_BOARD_WIDTH", "1920"))
@@ -89,13 +90,13 @@ class PyroConf(object):
 
     for _name in ("PARALLEL_DOWNLOAD_WORKERS", "PARALLEL_UPLOAD_WORKERS",
                   "DOWNLOAD_REQUESTS_PER_CONNECTION", "UPLOAD_REQUESTS_PER_CONNECTION",
-                  "MAX_UPLOAD_REQUESTS_PER_CONNECTION", "TRANSFER_CRYPTO_WORKERS",
+                  "MAX_UPLOAD_REQUESTS_PER_CONNECTION", "MAX_DOWNLOAD_REQUESTS_PER_CONNECTION", "TRANSFER_CRYPTO_WORKERS",
                   "MAX_ACTIVE_TRANSFERS",
                   "TRANSFER_BUFFER_MIB", "DISK_RESERVE_MIB"):
         if locals()[_name] <= 0:
             raise ValueError(f"{_name} must be positive")
     if max(DOWNLOAD_REQUESTS_PER_CONNECTION, UPLOAD_REQUESTS_PER_CONNECTION,
-           MAX_UPLOAD_REQUESTS_PER_CONNECTION) > 8:
+           MAX_UPLOAD_REQUESTS_PER_CONNECTION, MAX_DOWNLOAD_REQUESTS_PER_CONNECTION) > 8:
         raise ValueError("Requests per connection must not exceed 8")
     if TRANSFER_CRYPTO_WORKERS > 8:
         raise ValueError("TRANSFER_CRYPTO_WORKERS must not exceed 8")
@@ -103,6 +104,8 @@ class PyroConf(object):
         raise ValueError("Use at most 16 connections per direction and 4 active transfers")
     if MAX_UPLOAD_REQUESTS_PER_CONNECTION < UPLOAD_REQUESTS_PER_CONNECTION:
         raise ValueError("Maximum upload requests must be at least the starting value")
+    if MAX_DOWNLOAD_REQUESTS_PER_CONNECTION < DOWNLOAD_REQUESTS_PER_CONNECTION:
+        raise ValueError("Maximum download requests must be at least the starting value")
     if not (0 < TRANSFER_TUNE_INTERVAL <= 60 and 0 < TRANSFER_TUNE_COOLDOWN <= 600
             and 0 < TRANSFER_TUNE_MIN_GAIN <= 1):
         raise ValueError("Invalid transfer tuning interval, cooldown or minimum gain")

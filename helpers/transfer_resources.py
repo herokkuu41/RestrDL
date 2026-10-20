@@ -26,6 +26,8 @@ class ResourceMonitor:
         self.last_time = time.monotonic()
         self.last_cpu = self.cpu_seconds()
         self.cpu = self.memory = 0.0
+        self.throttled = 0.0
+        self.last_throttled = self.throttled_seconds()
         self.last_check = -float("inf")
 
     def read(self, name):
@@ -55,6 +57,17 @@ class ResourceMonitor:
         cpu = self.process.cpu_times()
         return cpu.user + cpu.system
 
+    def throttled_seconds(self):
+        stat = dict(line.split() for line in self.read("cpu.stat").splitlines() if len(line.split()) == 2)
+        if "throttled_usec" in stat:
+            return int(stat["throttled_usec"]) / 1e6
+        stat = dict(line.split() for line in self.read("cpu/cpu.stat").splitlines() if len(line.split()) == 2)
+        return int(stat.get("throttled_time", 0)) / 1e9
+
+    def memory_pressure(self):
+        self.has_headroom()
+        return self.memory >= self.memory_target
+
     def has_headroom(self):
         now = time.monotonic()
         if now - self.last_check < 5:
@@ -63,6 +76,9 @@ class ResourceMonitor:
         cpu = self.cpu_seconds()
         if elapsed >= 0.1:
             self.cpu = max(0, 100 * (cpu - self.last_cpu) / elapsed / max(self.cores, 0.01))
+            throttled = self.throttled_seconds()
+            self.throttled = max(0, 100 * (throttled - self.last_throttled) / elapsed)
+            self.last_throttled = throttled
             self.last_time, self.last_cpu = now, cpu
         current, limit = self.number("memory.current"), self.number("memory.max")
         if not limit:

@@ -1,4 +1,4 @@
-"""ACK-based upload trials shared by active files within one bounded manager."""
+"""ACK-based request windows shared by active files within one bounded manager."""
 import asyncio
 import time
 from contextlib import asynccontextmanager
@@ -6,12 +6,14 @@ from contextlib import asynccontextmanager
 
 class UploadWindow:
     def __init__(self, initial, maximum, step, interval=5, cooldown=30, gain=0.10,
-                 headroom=None, adaptive=True):
+                 headroom=None, adaptive=True, memory_pressure=None):
         self.limit = self.confirmed = initial
         self.initial = initial
         self.maximum, self.step = maximum, step
         self.interval, self.cooldown, self.gain = interval, cooldown, gain
         self.headroom = headroom or (lambda: True)
+        self.memory_pressure = memory_pressure or (lambda: False)
+        self.pressure_until = 0
         self.adaptive = adaptive
         self.recovery_until = 0
         self.confirmed_rate = 0
@@ -29,7 +31,7 @@ class UploadWindow:
         """Discard rate history between busy periods; retain a throttle cooldown."""
         now = time.monotonic()
         start = min(warm or self.initial, self.maximum)
-        if now < self.recovery_until:
+        if now < max(self.recovery_until, self.pressure_until):
             start = min(start, self.confirmed)
         self.limit = self.confirmed = start
         if warm is None:
@@ -74,11 +76,22 @@ class UploadWindow:
 
     def sample(self, rate, saturated, now):
         self.rate = rate
-        if not self.headroom():
-            self.confirmed = max(1, min(self.confirmed, self.limit - self.step))
-            self.confirmed_rate = 0
-            return self.rollback(now, "resource-pressure")
         if not self.adaptive:
+            return None
+        if not self.headroom():
+            self.samples.clear()
+            # Busy CPU is useful work, not evidence that the established window
+            # is too large. Previously each sample removed another connection's
+            # worth of work, eventually reducing sustained transfers to one RPC.
+            # Only actual memory pressure shrinks the established window, with
+            # a cooldown so one high reading cannot repeatedly cut capacity.
+            if self.memory_pressure() and now >= self.pressure_until:
+                self.confirmed = max(1, self.confirmed - self.step)
+                self.confirmed_rate = 0
+                self.pressure_until = now + self.cooldown
+                return self.rollback(now, "memory-pressure")
+            if self.trial:
+                return self.rollback(now, "resource-pressure")
             return None
         if not saturated or rate <= 0:
             self.samples.clear()

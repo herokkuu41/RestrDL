@@ -6,7 +6,7 @@ import sys
 import pytest
 
 
-def load_config(tmp_path, **settings):
+def load_config(tmp_path, pools=True, **settings):
     env = {**os.environ, "BOT_TOKEN": "123456:TEST", "SESSION_STRING": "offline",
            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
            "PARALLEL_DOWNLOAD_WORKERS": "4", "PARALLEL_UPLOAD_WORKERS": "4",
@@ -15,10 +15,11 @@ def load_config(tmp_path, **settings):
            "TRANSFER_TUNE_COOLDOWN": "30", "TRANSFER_TUNE_MIN_GAIN": "0.1",
            "TRANSFER_CRYPTO_WORKERS": "4", "MAX_ACTIVE_TRANSFERS": "2",
            "TRANSFER_BUFFER_MIB": "64", **settings}
-    return subprocess.run([sys.executable, "-B", "-c",
-                           "from helpers.transfer import TransferManager; "
-                           "m=TransferManager(adaptive=False); "
-                           "print(m.downloads.capacity, m.uploads.capacity)"],
+    code = ("from helpers.transfer import TransferManager; "
+            "m=TransferManager(adaptive=False); "
+            "print(m.downloads.capacity, m.uploads.capacity)" if pools else
+            "from config import PyroConf")
+    return subprocess.run([sys.executable, "-B", "-c", code],
                           env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
 
 
@@ -32,16 +33,18 @@ def test_environment_overrides_reach_production_request_pools(tmp_path):
     {"MAX_UPLOAD_REQUESTS_PER_CONNECTION": "4"},
     {"TRANSFER_TUNE_INTERVAL": "nan"},
     {"UPLOAD_REQUESTS_PER_CONNECTION": "0"},
+    {"MAX_DOWNLOAD_REQUESTS_PER_CONNECTION": "2"},
+    {"MAX_DOWNLOAD_REQUESTS_PER_CONNECTION": "9"},
     {"TRANSFER_RPC_TIMEOUT": "0"},
     {"TRANSFER_FINALIZE_TIMEOUT": "nan"},
 ])
 def test_invalid_transfer_settings_fail_before_sessions_open(tmp_path, settings):
-    result = load_config(tmp_path, **settings)
+    result = load_config(tmp_path, pools=False, **settings)
     assert result.returncode != 0
     assert "ValueError" in result.stderr
 
 
-@pytest.mark.parametrize("profile,expected", [("throughput", "8 8 4 128"), ("balanced", "4 4 2 64")])
+@pytest.mark.parametrize("profile,expected", [("throughput", "12 12 4 256"), ("balanced", "4 4 2 64")])
 def test_profile_defaults_without_legacy_overrides(tmp_path, profile, expected):
     env = {**os.environ, "BOT_TOKEN": "123456:TEST", "SESSION_STRING": "offline",
            "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "TRANSFER_PROFILE": profile}

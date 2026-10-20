@@ -142,10 +142,62 @@ def test_warm_window_survives_an_unhelpful_trial_and_new_file():
     assert not control.samples and not control.trial
 
 
-def test_resource_pressure_blocks_growth_and_reduces_work():
+def test_busy_cpu_blocks_growth_without_reducing_established_work():
     control = UploadWindow(4, 12, 4, headroom=lambda: False)
-    assert control.sample(1000, True, 5) == "resource-pressure"
-    assert control.limit < 4 and not control.trial
+    for now in range(5, 125, 5):
+        assert control.sample(1000, True, now) is None
+    assert control.limit == control.confirmed == 4
+    assert not control.trial
+
+
+def test_cpu_spike_rolls_back_only_the_unconfirmed_trial():
+    busy = [False]
+    control = UploadWindow(4, 12, 4, headroom=lambda: not busy[0])
+    control.next_trial = 0
+    control.sample(100, True, 5)
+    assert control.sample(100, True, 10) == "trial"
+    busy[0] = True
+    assert control.sample(125, True, 15) == "resource-pressure"
+    for now in range(20, 100, 5):
+        control.sample(100, True, now)
+    assert control.limit == control.confirmed == 4
+    busy[0] = False
+    control.sample(100, True, 100)
+    assert control.sample(100, True, 105) == "trial"
+    control.sample(125, True, 110)
+    assert control.sample(125, True, 115) == "confirmed"
+    assert control.confirmed == 8
+
+
+def test_memory_pressure_reduces_work_once_per_cooldown_then_recovers():
+    pressure = [True]
+    control = UploadWindow(12, 20, 4, headroom=lambda: not pressure[0],
+                           memory_pressure=lambda: pressure[0])
+    assert control.sample(1000, True, 5) == "memory-pressure"
+    for now in (10, 15, 20, 25, 30):
+        assert control.sample(1000, True, now) is None
+    assert control.limit == control.confirmed == 8
+    assert control.sample(1000, True, 35) == "memory-pressure"
+    assert control.limit == 4
+    pressure[0] = False
+    control.sample(100, True, 65)
+    assert control.sample(100, True, 70) == "trial"
+    control.sample(125, True, 75)
+    assert control.sample(125, True, 80) == "confirmed"
+    assert control.limit == control.confirmed == 8
+
+
+def test_memory_cooldown_survives_file_reset(monkeypatch):
+    import helpers.transfer_window as module
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    control = UploadWindow(12, 20, 4, headroom=lambda: False, memory_pressure=lambda: True)
+    control.sample(1000, True, clock[0])
+    control.reset()
+    assert control.limit == control.confirmed == 8
+    clock[0] += 5
+    control.sample(1000, True, clock[0])
+    assert control.limit == 8
 
 
 def test_fixed_mode_does_not_start_trials_after_throttle():
