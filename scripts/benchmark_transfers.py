@@ -54,8 +54,11 @@ async def benchmark(args):
             (f"pipeline-{connections}", connections, 2, 4) for connections in args.connections]
         if args.adaptive:
             modes.append(("adaptive-4", 4, 2, None))
+        if args.production:
+            modes.append(("production", PyroConf.PARALLEL_DOWNLOAD_WORKERS, None, None))
         for mode, connections, download_requests, upload_requests in modes:
-            manager = transfer.TransferManager(downloads=connections, uploads=connections,
+            manager = transfer.TransferManager(downloads=connections,
+                uploads=PyroConf.PARALLEL_UPLOAD_WORKERS if mode == "production" else connections,
                 download_requests=download_requests, upload_requests=upload_requests,
                 adaptive=upload_requests is None)
             transfer._manager = manager
@@ -81,6 +84,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="Actually upload test posts to the destination")
     parser.add_argument("--adaptive", action="store_true", help="Add an ACK-tuned four-connection trial")
+    parser.add_argument("--production", action="store_true", help="Add one post with the production source isolation policy")
     parser.add_argument("--connections", nargs="+", type=int, choices=range(2, 9), default=[2, 4],
                         help="Connection counts to test for the new pipeline (default: 2 4)")
     parser.add_argument("--source", required=True, help="Representative Telegram post URL")

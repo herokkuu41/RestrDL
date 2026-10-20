@@ -287,6 +287,7 @@ async def test_premium_wait_keeps_file_and_acknowledged_parts(monkeypatch, direc
 
 
 def test_production_request_counts_control_pool_limits(monkeypatch):
+    monkeypatch.setattr(transfer.PyroConf, "DOWNLOAD_ISOLATED_READS", False)
     monkeypatch.setattr(transfer.PyroConf, "DOWNLOAD_REQUESTS_PER_CONNECTION", 2)
     monkeypatch.setattr(transfer.PyroConf, "UPLOAD_REQUESTS_PER_CONNECTION", 4)
     monkeypatch.setattr(transfer.PyroConf, "TRANSFER_ADAPTIVE", False)

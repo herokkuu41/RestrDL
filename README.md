@@ -33,9 +33,9 @@
 Install the updated `requirements.txt` and restart the existing bot. The transfer engine
 defaults to the `throughput` profile: twelve download and twelve upload connections
 across the entire bot, with at most two files active at once. Each download connection
-starts with four outstanding requests;
-each upload connection also starts with four. Both can grow to eight after measured
-improvement. Large-file ranges enter the upload queue as they finish, so a slow
+handles one outstanding read, preventing stalled reads from trapping sibling requests
+on the same connection. Upload connections start with four outstanding requests and
+can grow to eight after measured improvement. Large-file ranges enter the upload queue as they finish, so a slow
 range does not hold up ready parts. Small files retain ordered MD5 calculation.
 Albums share these limits. Queued data, upload slices, and retry
 payloads have a shared 256 MiB budget; this is a payload budget, not a cap on total process
@@ -51,10 +51,11 @@ The existing server-side copy/forward path remains the first choice when availab
 | `TRANSFER_PROFILE` | throughput | Preset: throughput or balanced; explicit overrides take precedence |
 | `PARALLEL_DOWNLOAD_WORKERS` | 12 | Global download connection slots |
 | `PARALLEL_UPLOAD_WORKERS` | 12 | Global upload connection slots |
-| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting download window per connection |
+| `DOWNLOAD_ISOLATED_READS` | true | One source RPC per connection; takes precedence over source multiplexing counts |
+| `DOWNLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting source window per connection when isolation is disabled |
 | `UPLOAD_REQUESTS_PER_CONNECTION` | 4 | Starting upload window per connection |
 | `TRANSFER_ADAPTIVE` | true | Trial larger download and upload windows using acknowledged throughput |
-| `MAX_DOWNLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global download RPC cap per connection |
+| `MAX_DOWNLOAD_REQUESTS_PER_CONNECTION` | 8 | Source RPC cap per connection when isolation is disabled |
 | `MAX_UPLOAD_REQUESTS_PER_CONNECTION` | 8 | Hard global upload RPC cap per connection |
 | `TRANSFER_TUNE_INTERVAL` | 3 | Seconds per ACK rate sample |
 | `TRANSFER_TUNE_COOLDOWN` | 10 | Seconds before another capacity trial |
@@ -62,6 +63,8 @@ The existing server-side copy/forward path remains the first choice when availab
 | `TRANSFER_CRYPTO_WORKERS` | 8 | Native encryption/decryption executor workers |
 | `TRANSFER_WARM_TTL` | 600 | Seconds confirmed request windows remain reusable for their route |
 | `TRANSFER_RPC_TIMEOUT` | 60 | Seconds to wait for one download chunk/upload part request |
+| `DOWNLOAD_STALL_TIMEOUT` | 15 | Whole source RPC watchdog, including readiness/encryption/socket drain |
+| `DOWNLOAD_CHUNK_ATTEMPTS` | 5 | Maximum attempts for a missing source chunk; other parts are retained |
 | `TRANSFER_FINALIZE_TIMEOUT` | 120 | Seconds to wait for Telegram media registration or final sending |
 | `TRANSFER_CPU_TARGET` | 95 | CPU percentage ceiling for growth, relative to the container quota |
 | `TRANSFER_MEMORY_TARGET` | 80 | Container memory percentage ceiling for growth |
@@ -74,13 +77,14 @@ The existing server-side copy/forward path remains the first choice when availab
 Existing environment variables override defaults: update any old
 request counts, connection counts and buffer settings to match `config.env.sample`.
 Setting the profile alone does not replace explicit old overrides. The balanced preset
-uses four connections per direction, two download requests per connection, and 64 MiB.
-The throughput preset starts with 48 simultaneous source ranges and 48 upload parts,
-with independently measured growth up to 96 in each direction. Eight native crypto
+uses four connections per direction and 64 MiB.
+The throughput preset starts with 12 isolated source ranges and 48 upload parts,
+with upload growth up to 96 parts. Eight native crypto
 executor threads allow encryption and decryption to use available CPU cores. These
 are shared limits across the service, not per-file multipliers. Set
 `TRANSFER_ADAPTIVE=false` for fixed
-request counts. Startup rejects unsafe or inconsistent limits; at most 16 connections
+upload counts (source congestion/throttle handling remains enabled only as described
+below). Startup rejects unsafe or inconsistent limits; at most 16 connections
 per direction, 8 requests per connection, 4 active files, and 512 MiB of payload are allowed.
 CDN streaming
 needs at least two download slots because it opens both an origin and a CDN session.
@@ -94,6 +98,10 @@ Failed/cancelled transfers release their buffers and connection slots. Albums ar
 only after every item is prepared; failure does not silently send an incomplete album.
 
 Both direction tuners change only outstanding requests, keeping connection counts fixed.
+The source window can recover up to the isolated connection cap; it cannot add more
+reads to an already busy connection. Set `DOWNLOAD_ISOLATED_READS=false` to explicitly
+benchmark the former multiplexed path. Explicit `download_requests` in the benchmark's
+manager constructor also selects that path for controlled comparisons.
 Active files share one window and require two source-supplied baseline intervals and
 two trial intervals; album items cannot multiply the initial window.
 A trial is kept only when average acknowledged throughput improves by at least 5%.
@@ -145,6 +153,9 @@ performance. Automated tests establish correctness and overlapping transfers, no
 guaranteed real-world speed increase.
 
 Add `--adaptive` for one additional real post using the ACK tuner. The benchmark also
+supports `--production` for one additional post with the deployed source isolation,
+upload connection counts and watchdog/recovery settings. These options send posts.
+The benchmark
 configures the same native crypto pool as production. To measure scheduler changes
 without credentials, network requests or test posts, run:
 
@@ -209,9 +220,17 @@ Progress clocks start when a file gets a transfer slot, excluding time queued be
 earlier videos. Progress displays both recent interval speed and active-transfer average.
 
 Chunk/part requests explicitly use a 60-second response timeout instead of the library's
-15-second default. Each failed request is retried locally, up to three attempts, retaining
-the same offset, part number, upload handle, and payload. This is a per-request timeout,
-not a deadline for the whole video. After the bytes are acknowledged, Telegram media
+15-second default. Source reads additionally have a 15-second watchdog around the entire
+RPC: the library's response timeout excludes readiness, encryption and socket drain.
+A timed-out worker is retired before retry; media-session shutdown is bounded to five
+seconds and aborts a stuck transport. The missing range gets up to five attempts while
+upload parts keep their three-attempt policy. Offsets, part numbers, upload handles and
+acknowledged data are retained. These deadlines apply to individual requests, not the
+whole video. Source latency above 2.5 times its healthy sample (and above two seconds),
+together with at least a 25% goodput drop, reduces source concurrency. A timeout also
+reduces the source window once per recovery period, at least 15 seconds; CPU activity
+alone never triggers this network backoff. Real FloodWait handling still applies.
+After the bytes are acknowledged, Telegram media
 registration and final sending have a separate 120-second response timeout and bounded
 application retries with stable random IDs for deduplication. Library transport retries
 are disabled on these calls to avoid stacking hidden retry loops. Progress switches to

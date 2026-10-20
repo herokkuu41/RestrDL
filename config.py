@@ -59,6 +59,10 @@ class PyroConf(object):
     TRANSFER_CRYPTO_WORKERS = int(getenv("TRANSFER_CRYPTO_WORKERS", "8" if TRANSFER_PROFILE == "throughput" else "4"))
     TRANSFER_WARM_TTL = float(getenv("TRANSFER_WARM_TTL", "600"))
     TRANSFER_RPC_TIMEOUT = float(getenv("TRANSFER_RPC_TIMEOUT", "60"))
+    # Isolate source RPCs even on deployments retaining older request overrides.
+    DOWNLOAD_ISOLATED_READS = getenv("DOWNLOAD_ISOLATED_READS", "true").lower() in ("true", "1", "yes")
+    DOWNLOAD_STALL_TIMEOUT = float(getenv("DOWNLOAD_STALL_TIMEOUT", "15"))
+    DOWNLOAD_CHUNK_ATTEMPTS = int(getenv("DOWNLOAD_CHUNK_ATTEMPTS", "5"))
     TRANSFER_FINALIZE_TIMEOUT = float(getenv("TRANSFER_FINALIZE_TIMEOUT", "120"))
     TRANSFER_CPU_TARGET = float(getenv("TRANSFER_CPU_TARGET", "95"))
     TRANSFER_MEMORY_TARGET = float(getenv("TRANSFER_MEMORY_TARGET", "80"))
@@ -116,6 +120,8 @@ class PyroConf(object):
         raise ValueError("Invalid warm profile TTL or resource targets")
     if not (0 < TRANSFER_RPC_TIMEOUT <= 300 and 0 < TRANSFER_FINALIZE_TIMEOUT <= 600):
         raise ValueError("Transfer request timeouts must be positive and within 300/600 seconds")
+    if not (0 < DOWNLOAD_STALL_TIMEOUT <= 120 and 1 <= DOWNLOAD_CHUNK_ATTEMPTS <= 8):
+        raise ValueError("Download stall timeout must be in (0, 120] and attempts in 1..8")
     if TRANSFER_BUFFER_MIB < 4 * MAX_ACTIVE_TRANSFERS:
         raise ValueError("TRANSFER_BUFFER_MIB must provide at least 4 MiB per active transfer")
 

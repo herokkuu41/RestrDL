@@ -356,13 +356,19 @@ class TransferManager:
         # Explicit request counts select a fixed window for controlled benchmarks.
         self.adaptive = (PyroConf.TRANSFER_ADAPTIVE and upload_requests is None
                          if adaptive is None else adaptive)
+        # Explicit source request counts retain the multiplexed path for A/B
+        # benchmarks. Production defaults isolate stalled reads from siblings;
+        # old environment request counts cannot silently re-enable multiplexing.
+        self.isolated_reads = PyroConf.DOWNLOAD_ISOLATED_READS and download_requests is None
+        if self.isolated_reads:
+            download_requests = 1
         self.upload_initial = (uploads or PyroConf.PARALLEL_UPLOAD_WORKERS) * (
             upload_requests or PyroConf.UPLOAD_REQUESTS_PER_CONNECTION)
         self.download_initial = (downloads or PyroConf.PARALLEL_DOWNLOAD_WORKERS) * (
             download_requests or PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION)
         self.downloads = ConnectionPool(downloads or PyroConf.PARALLEL_DOWNLOAD_WORKERS,
             max(download_requests or PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION,
-                PyroConf.MAX_DOWNLOAD_REQUESTS_PER_CONNECTION) if self.adaptive else
+                PyroConf.MAX_DOWNLOAD_REQUESTS_PER_CONNECTION) if self.adaptive and not self.isolated_reads else
             download_requests or PyroConf.DOWNLOAD_REQUESTS_PER_CONNECTION)
         self.uploads = ConnectionPool(uploads or PyroConf.PARALLEL_UPLOAD_WORKERS,
             max(upload_requests or PyroConf.UPLOAD_REQUESTS_PER_CONNECTION,
@@ -385,6 +391,7 @@ class TransferManager:
         self.profile_routes = {}
         self.rpc_count = {"download": 0, "upload": 0}
         self.rpc_seconds = {"download": 0.0, "upload": 0.0}
+        self.timeout_count = {"download": 0, "upload": 0}
         self.resources = ResourceMonitor(PyroConf.TRANSFER_CPU_TARGET, PyroConf.TRANSFER_MEMORY_TARGET)
         self.upload_window = UploadWindow(self.upload_initial, self.uploads.capacity,
             len(self.uploads.sessions), PyroConf.TRANSFER_TUNE_INTERVAL,
@@ -393,7 +400,7 @@ class TransferManager:
         self.download_window = UploadWindow(self.download_initial, self.downloads.capacity,
             len(self.downloads.sessions), PyroConf.TRANSFER_TUNE_INTERVAL,
             PyroConf.TRANSFER_TUNE_COOLDOWN, PyroConf.TRANSFER_TUNE_MIN_GAIN,
-            self.resources.has_headroom, self.adaptive, self.resources.memory_pressure)
+            self.resources.has_headroom, self.adaptive, self.resources.memory_pressure, latency_guard=True)
 
     async def invoke(self, worker, query, direction):
         """Expose server waits so all files pause dispatch in that direction."""
@@ -409,8 +416,16 @@ class TransferManager:
                     if self.paused_until[direction] > time.monotonic():
                         continue
                     requested = time.monotonic()
-                    result = await worker.session.invoke(query, sleep_threshold=0, retries=0,
-                                                         timeout=PyroConf.TRANSFER_RPC_TIMEOUT)
+                    call = worker.session.invoke(query, sleep_threshold=0, retries=0,
+                                                 timeout=PyroConf.TRANSFER_RPC_TIMEOUT)
+                    if direction == "download":
+                        # Session.invoke's timeout covers response waiting only,
+                        # excluding readiness, encryption and socket drain. Bound
+                        # the whole source RPC and drain cancellation before the
+                        # pool retires the session (including its pending results).
+                        result = await asyncio.wait_for(call, timeout=PyroConf.DOWNLOAD_STALL_TIMEOUT)
+                    else:
+                        result = await call
                     self.rpc_count[direction] += 1
                     self.rpc_seconds[direction] += time.monotonic() - requested
                     amount = 0
@@ -419,8 +434,10 @@ class TransferManager:
                         amount = len(query.bytes)
                     elif isinstance(result, raw.types.upload.File):
                         amount = len(result.bytes)
-                    change = window.acknowledge(amount) if amount else None
+                    change = window.acknowledge(amount, latency=time.monotonic() - requested) if amount else None
                     if change:
+                        if change == "source-latency":
+                            self.download_profiles.clear()
                         if change == "memory-pressure":
                             self.profiles.clear()
                             self.download_profiles.clear()
@@ -431,10 +448,17 @@ class TransferManager:
                             window.limit, window.confirmed, window.maximum, window.rate / CHUNK_SIZE)
                     return result
             except TimeoutError:
+                self.timeout_count[direction] += 1
+                if direction == "download":
+                    self.download_profiles.clear()
+                    if self.download_window.stall():
+                        LOGGER(__name__).warning("Source congestion: reduced read window to %s/%s",
+                            self.download_window.limit, self.download_window.maximum)
                 LOGGER(__name__).warning(
-                    "Relay request timeout: direction=%s rpc=%s offset=%s part=%s timeout=%ss",
+                    "Relay request timeout: direction=%s rpc=%s offset=%s part=%s timeout=%ss watchdog=%ss",
                     direction, type(query).__name__, getattr(query, "offset", None),
-                    getattr(query, "file_part", None), PyroConf.TRANSFER_RPC_TIMEOUT)
+                    getattr(query, "file_part", None), PyroConf.TRANSFER_RPC_TIMEOUT,
+                    PyroConf.DOWNLOAD_STALL_TIMEOUT if direction == "download" else None)
                 raise
             except (FloodWait, FloodPremiumWait) as error:
                 attempts += 1
@@ -479,10 +503,20 @@ class TransferManager:
             return response.bytes
         self.download_window.pending += 1
         try:
-            return await retry(operation)
-        except TimeoutError as error:
-            raise TimeoutError(f"Download chunk at byte {offset} timed out after 3 attempts "
-                               f"({PyroConf.TRANSFER_RPC_TIMEOUT:g}s per request)") from error
+            for attempt in range(PyroConf.DOWNLOAD_CHUNK_ATTEMPTS):
+                try:
+                    return await operation()
+                except TRANSIENT as error:
+                    if attempt + 1 == PyroConf.DOWNLOAD_CHUNK_ATTEMPTS:
+                        if isinstance(error, TimeoutError):
+                            raise TimeoutError(f"Download chunk at byte {offset} stalled after "
+                                f"{attempt + 1} attempts (source watchdog "
+                                f"{PyroConf.DOWNLOAD_STALL_TIMEOUT:g}s; RPC timeout "
+                                f"{PyroConf.TRANSFER_RPC_TIMEOUT:g}s)") from error
+                        raise
+                    LOGGER(__name__).warning("Retrying missing source chunk: offset=%s attempt=%s/%s reason=%s",
+                        offset, attempt + 2, PyroConf.DOWNLOAD_CHUNK_ATTEMPTS, type(error).__name__)
+                    await asyncio.sleep(min(0.25 * (attempt + 1), 1))
         finally:
             self.download_window.pending -= 1
 
@@ -570,11 +604,11 @@ class TransferManager:
             self.download_window.reset(download_warm)
             LOGGER(__name__).info(
                 "transfer=%s start window=%s/%s download-window=%s/%s warm=%s/%s "
-                "cpu=%.1f%% memory=%.1f%% cores=%.2f payload-buffer=%s MiB",
+                "cpu=%.1f%% memory=%.1f%% cores=%.2f payload-buffer=%s MiB isolated-reads=%s",
                 transfer_id, window.limit, window.maximum, self.download_window.limit,
                 self.download_window.maximum, warm is not None, download_warm is not None,
                 self.resources.cpu, self.resources.memory, self.resources.cores,
-                self.budget.limit // CHUNK_SIZE)
+                self.budget.limit // CHUNK_SIZE, self.isolated_reads)
         self.upload_users.add(token)
         self.profile_routes[token] = profile_key
         completed = False
@@ -603,14 +637,15 @@ class TransferManager:
                     "transfer=%s produced=%s acked=%s queue-estimate=%s window=%s/%s inflight=%s "
                     "buffer=%s/%s waiting=%s cpu=%.1f%% memory=%.1f%% "
                     "download-window=%s/%s download-inflight=%s recent-MiB/s=%.2f/%.2f "
-                    "rpc-ms=%.1f/%.1f cpu-throttled=%.1f%% rss-MiB=%.1f",
+                    "rpc-ms=%.1f/%.1f cpu-throttled=%.1f%% rss-MiB=%.1f timeouts=%s/%s",
                     transfer_id, downloaded, uploaded, queue.qsize() * PART_SIZE,
                     window.limit, window.maximum, window.active, self.budget.used,
                     self.budget.limit, "sink" if window.pending > window.active else "source",
                     self.resources.cpu, self.resources.memory, self.download_window.limit,
                     self.download_window.maximum, self.download_window.active, recent_down, recent_up,
                     latency["download"], latency["upload"], self.resources.throttled,
-                    self.resources.process.memory_info().rss / CHUNK_SIZE)
+                    self.resources.process.memory_info().rss / CHUNK_SIZE,
+                    self.timeout_count["download"], self.timeout_count["upload"])
             if progress:
                 await progress(key, downloaded, uploaded, size)
 
@@ -734,7 +769,7 @@ class TransferManager:
                 for control, initial, profiles in (
                         (window, self.upload_initial, self.profiles),
                         (self.download_window, self.download_initial, self.download_profiles)):
-                    if control.confirmed_rate > 0 and control.confirmed >= initial:
+                    if control.confirmed_rate > 0 and (control is self.download_window or control.confirmed >= initial):
                         if len(profiles) >= 32:
                             profiles.pop(next(iter(profiles)))
                         profiles[profile_key] = (control.confirmed, time.monotonic() + PyroConf.TRANSFER_WARM_TTL)

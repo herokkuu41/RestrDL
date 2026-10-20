@@ -6,13 +6,17 @@ from contextlib import asynccontextmanager
 
 class UploadWindow:
     def __init__(self, initial, maximum, step, interval=5, cooldown=30, gain=0.10,
-                 headroom=None, adaptive=True, memory_pressure=None):
+                 headroom=None, adaptive=True, memory_pressure=None, latency_guard=False):
         self.limit = self.confirmed = initial
         self.initial = initial
         self.maximum, self.step = maximum, step
         self.interval, self.cooldown, self.gain = interval, cooldown, gain
         self.headroom = headroom or (lambda: True)
         self.memory_pressure = memory_pressure or (lambda: False)
+        self.latency_guard = latency_guard
+        self.latency_seconds = self.latency_samples = 0
+        self.healthy_latency = None
+        self.healthy_rate = 0
         self.pressure_until = 0
         self.adaptive = adaptive
         self.recovery_until = 0
@@ -40,6 +44,9 @@ class UploadWindow:
         self.samples.clear()
         self.baseline = None
         self.acked = self.busy_acked = 0
+        self.latency_seconds = self.latency_samples = 0
+        self.healthy_latency = None
+        self.healthy_rate = 0
         self.last_sample = now
         self.next_trial = max(now, self.next_trial)
 
@@ -59,9 +66,12 @@ class UploadWindow:
                 self.active -= 1
                 self.condition.notify_all()
 
-    def acknowledge(self, amount, now=None):
+    def acknowledge(self, amount, now=None, latency=None):
         now = time.monotonic() if now is None else now
         self.acked += amount
+        if latency is not None:
+            self.latency_seconds += latency
+            self.latency_samples += 1
         if self.pending > self.active or self.waiting or self.active >= self.limit:
             self.busy_acked += amount
         elapsed = now - self.last_sample
@@ -72,6 +82,17 @@ class UploadWindow:
         saturated = self.busy_acked >= 0.8 * self.acked
         self.acked = self.busy_acked = 0
         self.last_sample = now
+        latency = self.latency_seconds / self.latency_samples if self.latency_samples else None
+        self.latency_seconds = self.latency_samples = 0
+        if (self.latency_guard and self.adaptive and saturated and latency is not None):
+            if (self.healthy_latency is not None and now >= self.recovery_until
+                    and latency > max(2.0, self.healthy_latency * 2.5)
+                    and rate < self.healthy_rate * 0.75):
+                self.stall(now)
+                self.healthy_latency, self.healthy_rate = None, 0
+                return "source-latency"
+            if self.healthy_latency is None or rate > self.healthy_rate:
+                self.healthy_latency, self.healthy_rate = latency, rate
         return self.sample(rate, saturated, now)
 
     def sample(self, rate, saturated, now):
@@ -112,6 +133,7 @@ class UploadWindow:
             self.baseline = None
             self.next_trial = now + self.cooldown
             return "confirmed"
+        self.confirmed_rate = average
         if now >= self.next_trial and self.limit < self.maximum:
             self.baseline = average
             self.limit = min(self.maximum, self.limit + self.step)
@@ -136,3 +158,19 @@ class UploadWindow:
         self.confirmed_rate = 0
         self.acked = self.busy_acked = 0
         self.last_sample = now
+
+    def stall(self, now=None):
+        """One congestion response per timeout wave; do not cancel other reads."""
+        now = time.monotonic() if now is None else now
+        if now < self.recovery_until or not self.adaptive:
+            return False
+        # A slow/missing response is network pressure, unlike busy CPU. Keep at
+        # least two lanes for recovery, unless the configured cap is only one.
+        self.confirmed = max(min(2, self.maximum), self.confirmed // 2)
+        self.confirmed_rate = 0
+        self.rollback(now, "source-stall")
+        self.recovery_until = now + max(self.cooldown, 15)
+        self.next_trial = self.recovery_until
+        self.acked = self.busy_acked = 0
+        self.last_sample = now
+        return True

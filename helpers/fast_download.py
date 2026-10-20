@@ -185,13 +185,36 @@ class MTProtoWorkerSession:
         else:
             raise RuntimeError(f"Unexpected MTProto response type: {type(r)}")
 
-    async def stop(self) -> None:
-        if self.session:
-            try:
-                await self.session.stop()
-            except Exception:
-                pass
-            self.session = None
+    async def stop(self, timeout=5) -> None:
+        session, self.session = self.session, None
+        if session is None:
+            return
+        stopped = False
+        try:
+            await asyncio.wait_for(session.stop(), timeout=timeout)
+            stopped = True
+        except Exception as error:
+            LOGGER(__name__).debug("Media session stop failed: %s", type(error).__name__)
+        finally:
+            if not stopped:
+                # A ping blocked in socket drain must not hold the pool slot
+                # indefinitely. Abort only this worker's transport and drain its
+                # background tasks before a replacement can reuse the slot.
+                connection = getattr(session, "connection", None)
+                protocol = getattr(connection, "protocol", None)
+                writer = getattr(protocol, "writer", None)
+                if writer is not None:
+                    writer.transport.abort()
+                tasks = [task for task in (getattr(session, "ping_task", None),
+                                          getattr(session, "recv_task", None))
+                         if isinstance(task, asyncio.Task)]
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            results = getattr(session, "results", None)
+            if isinstance(results, dict):
+                results.clear()
 
 
 def resolve_destination_path(message: Any, file_name: Optional[str], media_kind: str, original_file_name: Optional[str]) -> str:

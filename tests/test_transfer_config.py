@@ -14,6 +14,7 @@ def load_config(tmp_path, pools=True, **settings):
            "MAX_UPLOAD_REQUESTS_PER_CONNECTION": "8", "TRANSFER_TUNE_INTERVAL": "5",
            "TRANSFER_TUNE_COOLDOWN": "30", "TRANSFER_TUNE_MIN_GAIN": "0.1",
            "TRANSFER_CRYPTO_WORKERS": "4", "MAX_ACTIVE_TRANSFERS": "2",
+           "DOWNLOAD_ISOLATED_READS": "false",
            "TRANSFER_BUFFER_MIB": "64", **settings}
     code = ("from helpers.transfer import TransferManager; "
             "m=TransferManager(adaptive=False); "
@@ -37,6 +38,8 @@ def test_environment_overrides_reach_production_request_pools(tmp_path):
     {"MAX_DOWNLOAD_REQUESTS_PER_CONNECTION": "9"},
     {"TRANSFER_RPC_TIMEOUT": "0"},
     {"TRANSFER_FINALIZE_TIMEOUT": "nan"},
+    {"DOWNLOAD_STALL_TIMEOUT": "nan"},
+    {"DOWNLOAD_CHUNK_ATTEMPTS": "0"},
 ])
 def test_invalid_transfer_settings_fail_before_sessions_open(tmp_path, settings):
     result = load_config(tmp_path, pools=False, **settings)
